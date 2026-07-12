@@ -14,6 +14,7 @@
     <a href="#features">功能特性</a> ·
     <a href="#quick-start">部署指南</a> ·
     <a href="#architecture">架构设计</a> ·
+    <a href="CHANGELOG.md">更新日志</a> ·
     <a href="#license">开源协议</a>
   </p>
   <p>
@@ -29,9 +30,14 @@
 
 > 想象一下，随时随地打开浏览器，就能以极具科技感的赛博朋克 UI 连接你的服务器，无需安装任何 SSH 客户端。
 
-![Demo 1](./demo1.png)
-![Demo 2](./demo2.png)
-![Demo 3](./demo3.png)
+<div align="center">
+  <a href="https://www.bilibili.com/video/BV1UgMt6UEdF" target="_blank" title="点击播放视频">
+    <img src="https://i1.hdslb.com/bfs/archive/28a55cf05e4b5608e7ee0345b043e7ea97c81ed7.jpg" alt="CloudSSH 演示视频" width="720" />
+    <br/>
+    <img src="https://img.shields.io/badge/%E2%96%B6_%E7%82%B9%E5%87%BB%E6%92%AD%E6%94%BE%E8%A7%86%E9%A2%91-00A1D6?style=for-the-badge&logo=bilibili&logoColor=white" alt="播放" />
+  </a>
+  <p><sub>视频时长 8:27 · 演示 CloudSSH 完整使用流程</sub></p>
+</div>
 
 ## 目录
 
@@ -79,7 +85,7 @@
 - **多种认证方式**：支持标准 SSH 密码认证以及基于 Ed25519 的纯文本私钥认证。
 - **防范中间人攻击 (TOFU)**：首次连接自动提取服务器 Host Key（SHA-256 指纹）并显示，支持 Ed25519/ECDSA/RSA 签名验证，并在本地及 API 持久化缓存已知主机指纹以防范二次连接的欺骗风险。
 - **全功能极客终端**：基于 `@xterm/xterm` 与 `@xterm/addon-webgl` 硬件加速渲染引擎，保证海量日志输出顺滑不卡顿。
-- **个性化 UI**：全站颜色基于 CSS 变量系统，提供 Cyberpunk、Glacier、Gruvbox 内置主题一键切换。支持导入自定义 JSON 主题文件（登录用户自动云端同步，跨浏览器生效），配套[可视化主题编辑器](https://newbietan.github.io/CloudSSH/)可在线调色并导出。支持移动端适配。
+- **个性化 UI**：全站颜色基于 CSS 变量系统，提供 Cyberpunk、Glacier、Gruvbox 内置主题一键切换。配套[可视化主题编辑器](https://newbietan.github.io/CloudSSH/)支持实时调色预览（覆盖登录页、服务器列表、终端 + SFTP、AI Agent 面板），导出 JSON 主题文件，登录用户可一键同步至云端、跨浏览器生效。支持移动端适配。
 - **SFTP 图形化文件管理**：集成完整的 SFTP v3 文件传输协议，提供图形化文件浏览器界面。支持目录浏览、文件上传/下载、新建文件夹、文件重命名与删除等操作。基于 SSH 子系统实现，与终端会话并行运行，互不干扰，支持并发下载及上传取消。
 - **原生文件传输**：集成 [trzsz.js](https://github.com/trzsz/trzsz.js)，支持 `trz`（上传）/ `tsz`（下载）命令进行文件传输，兼容 tmux 会话。还支持拖拽文件到终端窗口直接上传、目录传输及断点续传等高级功能。（需远程服务器安装 [trzsz](https://trzsz.github.io/)）
 - **GitHub OAuth 集成**：支持 GitHub 登录，用户可保存和管理常用 SSH 服务器，实现一键连接。
@@ -88,6 +94,7 @@
 - **双段延迟与 Colo 展示**：状态栏即时且周期性地展示当前 RTT（客户端至 Cloudflare）、物理延迟（Cloudflare 至主机）以及 Cloudflare 当前服务的数据中心代码（如 `CF-LAX`）。
 - **终端文本检索**：支持使用快捷键 `Ctrl+Shift+F` 呼出搜索框，实时检索终端历史日志。
 - **终端日志一键导出**：支持通过顶栏的下载按钮，将当前活跃会话终端的完整屏幕历史 buffer 一键导出并下载为 `.txt` 文本文件，解决长日志在浏览器下鼠标选取容易卡顿的痛点。
+- **AI 智能助手**：内置 AI Agent 侧边栏，支持 BYOK（自带 API Key）接入 OpenAI 兼容接口（如 DeepSeek）。提供 8 个专业运维工具：执行命令、读取终端上下文、探测服务器环境、进程列表、systemctl 服务管理、Docker 容器管理、用户确认、结构化报告输出。支持 LLM 流式输出（逐字显示），危险命令自动拦截或弹窗确认。**思考过程容器**：多步骤任务执行时，实时预览最近 1-2 条命令，完成后自动折叠显示总步骤数，支持展开查看完整执行历史。
 
 <a id="architecture"></a>
 ## 架构说明
@@ -99,25 +106,30 @@ flowchart TB
     subgraph "浏览器客户端"
         UI["前端 UI<br/>TypeScript + xterm.js"]
         SFTP["SFTP 文件管理器"]
+        Agent["AI 智能助手"]
         Trzsz["trzsz 文件传输"]
     end
-    
+
     subgraph "Cloudflare Edge Network"
         Worker["Worker<br/>路由 + API"]
         SSH_DO["SSHSessionDO<br/>SSH 会话管理"]
         User_DO["UserDBDO<br/>用户数据管理"]
+        AgentCore["AgentCore<br/>AI 控制循环"]
     end
-    
+
     subgraph "目标服务器"
         SSH["SSH 服务器<br/>(OpenSSH/Dropbear)"]
     end
 
     UI <-->|"WebSocket<br/>终端 I/O"| Worker
     SFTP <-->|"WebSocket<br/>SFTP 数据"| Worker
+    Agent <-->|"WebSocket<br/>Agent 消息"| Worker
     Trzsz <-->|"trzsz 协议"| UI
     Worker <-->|"WebSocket"| SSH_DO
     Worker <-->|"Internal API"| User_DO
     SSH_DO <-->|"TCP Socket<br/>@cloudflare/sockets"| SSH
+    SSH_DO <-->|"Exec Channel"| AgentCore
+    AgentCore <-->|"LLM API"| External["外部 LLM 服务"]
 ```
 
 ### 核心组件
@@ -134,6 +146,11 @@ flowchart TB
 | **前端终端** | `frontend/src/terminal.ts` | xterm.js 封装、实时双段延迟心跳、终端搜索及 WebSocket 交互 |
 | **标签管理器** | `frontend/src/tab-manager.ts` | 单页面多会话标签页管理器，协调不同标签页内的终端与 SFTP 实例 |
 | **SFTP 面板** | `frontend/src/sftp-panel.ts` | 图形化文件管理器 UI，支持上传/下载队列和取消操作 |
+| **AI Agent** | `src/worker/agent/core.ts` | AI 控制循环：LLM 流式调用、工具执行、环境探测、终端上下文读取 |
+| **Agent 工具** | `src/worker/agent/tools.ts` | 8 个运维工具定义（执行命令、终端上下文、环境探测、进程列表、服务管理、Docker 管理、用户确认、报告输出） |
+| **Agent 安全** | `src/worker/agent/safety.ts` | 两层安全策略：直接拦截（rm -rf /、fork bomb 等）+ 弹窗确认（rm、shutdown、iptables 等） |
+| **Agent 面板** | `frontend/src/agent/agent-panel.ts` | AI 助手侧边栏 UI，支持流式输出、Markdown 渲染、可折叠思考过程容器、确认对话框 |
+| **AI 配置** | `frontend/src/ai-config.ts` | AI 模型配置弹窗，支持 Base URL / API Key / 模型选择 |
 
 ### SSH 协议实现
 
@@ -157,6 +174,7 @@ flowchart TB
 4. SSHSession 执行完整的 SSH 协议协商（版本交换→密钥交换→认证→打开通道→PTY→Shell）。
 5. 加密的终端数据通过 WebSocket 在前端和 SSH 服务器之间双向转发。
 6. SFTP 文件管理通过独立的 SSH 子系统通道运行，支持目录浏览、文件上传/下载等操作。
+7. AI 助手通过 WebSocket 接收用户消息，AgentCore 调用外部 LLM API，通过 SSH exec 通道执行命令，结果流式返回前端。
 
 <a id="quick-start"></a>
 ## 快速部署
@@ -170,6 +188,13 @@ flowchart TB
 ### 部署步骤
 
 #### 方式一：通过 GitHub 绑定自动部署（推荐）
+
+<div align="center">
+  <a href="https://dash.cloudflare.com/?url=https://github.com/newbietan/CloudSSH">
+    <img src="https://img.shields.io/badge/Deploy_to_Cloudflare-FF6633?style=for-the-badge&logo=cloudflare&logoColor=white" alt="Deploy to Cloudflare">
+  </a>
+  <p>点击按钮跳转至 Cloudflare 控制台，授权 GitHub 后即可自动完成部署（无需本地环境）</p>
+</div>
 
 1. **Fork 本仓库** 到你的 GitHub 账号。
 2. **创建 Worker 应用**：登录 Cloudflare，进入 Workers & Pages，点击创建应用，绑定你的 GitHub 账号，选择 Fork 的仓库。
@@ -265,13 +290,16 @@ flowchart TB
 ```
 CloudSSH/
 ├── src/                    # 后端源码 (Cloudflare Worker)
-│   ├── ssh/                # SSH 协议纯实现层
+│   ├── ssh/                # SSH 协议纯实现层（传输、加密、认证、通道、SFTP）
 │   └── worker/             # Worker 入口和 Durable Objects
+│       └── agent/          # AI Agent 控制循环、工具、安全检测
 ├── frontend/               # 前端源码 (独立 workspace)
 │   └── src/                # TypeScript + xterm.js + trzsz
+│       └── agent/          # AI 助手侧边栏 UI
 ├── docs/                   # GitHub Pages 静态资源
 │   └── theme-editor/       # 可视化主题编辑器
 ├── scripts/                # 构建脚本
+├── .github/workflows/      # CI/CD 自动部署配置
 ├── pnpm-workspace.yaml     # pnpm 工作区配置
 └── wrangler.toml           # Cloudflare 部署配置
 ```
@@ -352,6 +380,7 @@ test 分支（开发/测试）  ──合并──>  main 分支（生产）
 | **前端** | TypeScript + Vite + xterm.js | Web 终端模拟器，WebGL 硬件加速 |
 | **UI 框架** | Tailwind CSS (CDN) + CSS 变量主题系统 | 可切换内置主题，支持自定义 JSON 主题导入与云端同步 |
 | **文件传输** | trzsz.js | 支持 trz/tsz 命令、拖拽上传、断点续传 |
+| **AI 助手** | BYOK + OpenAI 兼容接口 | 自带 API Key，支持 DeepSeek 等兼容模型 |
 | **后端** | Cloudflare Workers | Serverless 边缘计算 |
 | **会话管理** | Durable Objects | SSH 会话隔离、Hibernation API |
 | **数据存储** | Durable Objects SQLite | 用户数据、服务器配置 |
@@ -368,10 +397,10 @@ test 分支（开发/测试）  ──合并──>  main 分支（生产）
 
 ## Star History
 
-<a href="https://www.star-history.com/?type=date&repos=newbietan%2FCloudSSH">
+<a href="https://www.star-history.com/?repos=newbietan%2FCloudSSH&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=newbietan/CloudSSH&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=newbietan/CloudSSH&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=newbietan/CloudSSH&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=newbietan/CloudSSH&type=date&theme=dark&legend=top-left&sealed_token=W6EXioqdcb2BEJNCLBVZIvRGDUYCaxki-xY1FfDVex2S8hS-ABAc84mDRxLIx0wQLFCd3Wh_p-t4bD4yT_iPkhi0_7Aciixag0Vj0_Qsqv3Wh_pbiD6Ykw" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=newbietan/CloudSSH&type=date&legend=top-left&sealed_token=W6EXioqdcb2BEJNCLBVZIvRGDUYCaxki-xY1FfDVex2S8hS-ABAc84mDRxLIx0wQLFCd3Wh_p-t4bD4yT_iPkhi0_7Aciixag0Vj0_Qsqv3Wh_pbiD6Ykw" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=newbietan/CloudSSH&type=date&legend=top-left&sealed_token=W6EXioqdcb2BEJNCLBVZIvRGDUYCaxki-xY1FfDVex2S8hS-ABAc84mDRxLIx0wQLFCd3Wh_p-t4bD4yT_iPkhi0_7Aciixag0Vj0_Qsqv3Wh_pbiD6Ykw" />
  </picture>
 </a>

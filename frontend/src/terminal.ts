@@ -72,6 +72,8 @@ export const UI_THEMES: Record<keyof typeof THEMES, Record<string, string>> = {
     '--modal-overlay': 'rgba(0, 0, 0, 0.8)',
     '--on-surface': '#e5e2e1',
     '--on-surface-variant': '#bbccb0',
+    '--agent-user-color': '#4af626',
+    '--agent-agent-color': '#14d1ff',
   },
   glacier: {
     '--bg': '#0a192f',
@@ -98,6 +100,8 @@ export const UI_THEMES: Record<keyof typeof THEMES, Record<string, string>> = {
     '--modal-overlay': 'rgba(0, 0, 0, 0.85)',
     '--on-surface': '#e6f1ff',
     '--on-surface-variant': '#8892b0',
+    '--agent-user-color': '#64ffda',
+    '--agent-agent-color': '#e6f1ff',
   },
   gruvbox: {
     '--bg': '#282828',
@@ -124,6 +128,8 @@ export const UI_THEMES: Record<keyof typeof THEMES, Record<string, string>> = {
     '--modal-overlay': 'rgba(0, 0, 0, 0.75)',
     '--on-surface': '#ebdbb2',
     '--on-surface-variant': '#a89984',
+    '--agent-user-color': '#b8bb26',
+    '--agent-agent-color': '#83a598',
   },
 };
 
@@ -143,9 +149,11 @@ export class SSHTerminal {
   private maxReconnectAttempts: number = 5;
   private reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
   private lastConfig: SSHConnectionConfig | null = null;
+  private canReconnect: boolean = true;
   private restoreCursorBlinkAfterReturnPrompt: boolean = false;
   private onSessionClosed?: (event: CloseEvent) => void;
   private onSessionReady?: () => void;
+  private onAgentFrameHandler?: (msg: any) => void;
   private sftpAttachUrl: string | null = null;
   private searchBox: HTMLElement | null = null;
   private searchInput: HTMLInputElement | null = null;
@@ -251,6 +259,16 @@ export class SSHTerminal {
 
   setSessionReadyHandler(handler: () => void): void {
     this.onSessionReady = handler;
+  }
+
+  setAgentFrameHandler(handler: (msg: any) => void): void {
+    this.onAgentFrameHandler = handler;
+  }
+
+  sendWebSocketMessage(data: string): void {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(data);
+    }
   }
 
   setLatencyUpdatedHandler(handler: (cfLatency: number | null, cfColo: string | null, wsLatency: number | null) => void): void {
@@ -400,6 +418,7 @@ export class SSHTerminal {
   async connect(config: SSHConnectionConfig, options: ConnectOptions = {}): Promise<void> {
     this.resetActiveConnection();
     this.lastConfig = config;
+    this.canReconnect = true;
     if (options.resetDisplay !== false) {
       this.showConnectingBanner();
     }
@@ -443,6 +462,7 @@ export class SSHTerminal {
   connectWithWebSocket(ws: WebSocket, hostInfo?: { host: string; port: number }): void {
     this.resetActiveConnection();
     this.lastConfig = hostInfo ? { host: hostInfo.host, port: hostInfo.port, username: '' } : null;
+    this.canReconnect = false;
     this.ws = ws;
     ws.binaryType = 'arraybuffer';
     this.showConnectingBanner();
@@ -495,6 +515,11 @@ export class SSHTerminal {
           const msg = JSON.parse(event.data);
           if (msg.type === 'sftp_attach') {
             this.sftpAttachUrl = msg.url || null;
+            return;
+          }
+
+          if (msg.type === 'agent_frame') {
+            this.onAgentFrameHandler?.(msg);
             return;
           }
 
@@ -558,7 +583,7 @@ export class SSHTerminal {
         return;
       }
 
-      if (this.lastConfig && this.reconnectAttempts < this.maxReconnectAttempts) {
+      if (this.canReconnect && this.lastConfig && this.reconnectAttempts < this.maxReconnectAttempts) {
         this.scheduleReconnect();
       }
     };

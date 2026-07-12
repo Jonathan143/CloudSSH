@@ -28,6 +28,7 @@
   --scrollbar-thumb-hover: rgba(134, 149, 125, 0.8);
   --scanline-tint: rgba(74, 246, 38, 0.02);
   --accent-glow: rgba(74, 246, 38, 0.08);
+  --accent-bg: rgba(74, 246, 38, 0.1);
   --modal-overlay: rgba(0, 0, 0, 0.8);
 }
 
@@ -36,6 +37,10 @@ body {
   background-color: var(--bg);
   color: var(--text);
   min-height: 100vh;
+}
+
+/* 终端页面需要禁止页面级滚动，通过 JS 切换此类名 */
+body.terminal-active {
   overflow: hidden;
 }
 
@@ -153,6 +158,30 @@ body {
   background: var(--scrollbar-thumb-hover);
 }
 
+/* Hide scrollbar for Agent input textarea */
+#agent-input {
+  scrollbar-width: none; /* Firefox */
+  -ms-overflow-style: none; /* IE/Edge */
+}
+
+#agent-input::-webkit-scrollbar {
+  display: none; /* WebKit (Chrome/Safari) */
+}
+
+/* Agent markdown table */
+.agent-table {
+  border-spacing: 0;
+}
+
+.agent-table th,
+.agent-table td {
+  word-break: break-word;
+}
+
+.agent-table tbody tr:hover {
+  background: color-mix(in srgb, var(--agent-agent-color) 8%, transparent);
+}
+
 /* ==================== User Space Styles ==================== */
 
 /* 服务器卡片 */
@@ -255,7 +284,7 @@ body {
   color: var(--text);
   font-family: 'JetBrains Mono', monospace;
   font-size: 12px;
-  width: 200px;
+  width: min(200px, calc(100% - 40px));
   padding: 2px 4px;
 }
 
@@ -415,4 +444,483 @@ body {
 @keyframes pulse {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }
+}
+
+/* ========== Agent Panel ========== */
+
+#agent-panel {
+  min-width: 280px;
+}
+
+/* ========== Agent Markdown Content (themed) ==========
+   Style the DOM output from marked.js. All colors come from CSS variables so
+   theme switching only touches :root variables — the markup is untouched. */
+
+.agent-md-content {
+  word-break: break-word;
+  line-height: 1.6;
+  color: var(--agent-agent-color);
+  font-size: 13px;
+}
+
+/* Headings */
+.agent-md-content h1,
+.agent-md-content h2,
+.agent-md-content h3,
+.agent-md-content h4,
+.agent-md-content h5,
+.agent-md-content h6 {
+  color: var(--agent-agent-color);
+  font-weight: 700;
+  line-height: 1.3;
+  margin: 12px 0 6px;
+}
+.agent-md-content > :is(h1, h2, h3, h4, h5, h6):first-child {
+  margin-top: 0;
+}
+.agent-md-content h1 { font-size: 18px; }
+.agent-md-content h2 { font-size: 16px; }
+.agent-md-content h3 { font-size: 14.5px; }
+.agent-md-content h4 { font-size: 13.5px; }
+.agent-md-content h5 { font-size: 12.5px; }
+.agent-md-content h6 { font-size: 12px; opacity: 0.85; }
+
+/* Paragraphs */
+.agent-md-content p {
+  margin: 4px 0;
+}
+
+/* Links */
+.agent-md-content a.agent-md-link,
+.agent-md-content a {
+  color: var(--agent-agent-color);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  opacity: 0.9;
+}
+.agent-md-content a:hover { opacity: 1; }
+
+/* Code: fenced blocks */
+.agent-md-content .agent-md-lang {
+  font-size: 10px;
+  opacity: 0.55;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  padding: 0 8px;
+  margin-bottom: 2px;
+  background: color-mix(in srgb, var(--agent-agent-color) 8%, transparent);
+  display: inline-block;
+  border-radius: 4px 4px 0 0;
+}
+.agent-md-content .agent-md-pre {
+  background: color-mix(in srgb, var(--agent-agent-color) 8%, transparent);
+  color: var(--agent-agent-color);
+  padding: 8px 10px;
+  border-radius: 4px;
+  font-size: 11.5px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin: 4px 0 8px;
+  border: 1px solid color-mix(in srgb, var(--agent-agent-color) 15%, transparent);
+}
+.agent-md-content .agent-md-pre code {
+  background: transparent;
+  padding: 0;
+  border: none;
+  color: inherit;
+  font-size: inherit;
+}
+
+/* Code: inline */
+.agent-md-content .agent-md-inline-code {
+  background: color-mix(in srgb, var(--agent-agent-color) 15%, transparent);
+  color: var(--agent-agent-color);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11.5px;
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+
+/* Lists */
+.agent-md-content ul {
+  list-style-type: disc;
+  padding-left: 22px;
+  margin: 4px 0;
+}
+.agent-md-content ol {
+  list-style-type: decimal;
+  padding-left: 22px;
+  margin: 4px 0;
+}
+.agent-md-content li {
+  margin: 2px 0;
+}
+.agent-md-content li > p {
+  margin: 1px 0;
+}
+.agent-md-content li > ul,
+.agent-md-content li > ol {
+  margin: 2px 0;
+}
+
+/* Task list (GFM): - [ ] / - [x] */
+.agent-md-content ul:has(> li > input[type="checkbox"]) {
+  list-style: none;
+  padding-left: 6px;
+}
+.agent-md-content li > input[type="checkbox"] {
+  margin-right: 6px;
+  accent-color: var(--agent-agent-color);
+}
+
+/* Blockquotes */
+.agent-md-content blockquote {
+  border-left: 3px solid var(--agent-agent-color);
+  margin: 8px 0;
+  padding: 2px 10px;
+  color: color-mix(in srgb, var(--agent-agent-color) 80%, var(--on-surface-variant));
+  font-style: italic;
+  background: color-mix(in srgb, var(--agent-agent-color) 5%, transparent);
+  border-radius: 0 4px 4px 0;
+}
+.agent-md-content blockquote p {
+  margin: 2px 0;
+}
+
+/* Horizontal rule */
+.agent-md-content hr {
+  border: none;
+  border-top: 1px solid color-mix(in srgb, var(--agent-agent-color) 25%, transparent);
+  margin: 10px 0;
+}
+
+/* Tables (GFM) */
+.agent-md-content table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 12px;
+  margin: 6px 0;
+  border-top: 2px solid var(--agent-agent-color);
+  display: block;
+  overflow-x: auto;
+}
+.agent-md-content thead { display: table-header-group; }
+.agent-md-content tbody { display: table-row-group; }
+.agent-md-content th,
+.agent-md-content td {
+  padding: 5px 10px;
+  border-bottom: 1px solid color-mix(in srgb, var(--agent-agent-color) 20%, transparent);
+  vertical-align: top;
+}
+.agent-md-content th {
+  font-weight: 700;
+  color: var(--agent-agent-color);
+  background: color-mix(in srgb, var(--agent-agent-color) 10%, transparent);
+  text-align: left;
+  white-space: nowrap;
+}
+.agent-md-content tbody tr:hover td {
+  background: color-mix(in srgb, var(--agent-agent-color) 6%, transparent);
+}
+
+/* Strikethrough (GFM) */
+.agent-md-content del {
+  opacity: 0.6;
+}
+
+/* Images */
+.agent-md-content .agent-md-img,
+.agent-md-content img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 4px;
+  margin: 4px 0;
+}
+
+/* Strong / Em */
+.agent-md-content strong {
+  color: var(--agent-agent-color);
+  font-weight: 700;
+}
+.agent-md-content em { font-style: italic; }
+
+/* Auto-resizing textarea for agent input */
+#agent-input {
+  font-family: inherit;
+}
+
+#agent-input::placeholder {
+  color: var(--on-surface-variant);
+  opacity: 0.7;
+}
+
+/* Agent send button */
+.agent-send-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: none;
+  background: var(--accent);
+  color: var(--on-accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  flex-shrink: 0;
+}
+
+.agent-send-btn:hover {
+  background: color-mix(in srgb, var(--accent) 85%, white);
+  transform: scale(1.08);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+.agent-send-btn:active {
+  transform: scale(0.95);
+}
+
+.agent-send-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+/* Streaming cursor — blinking block appended to streamed text */
+@keyframes agent-blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+
+.streaming-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1em;
+  background: var(--agent-agent-color);
+  margin-left: 3px;
+  vertical-align: text-bottom;
+  animation: agent-blink 1s step-end infinite;
+}
+
+/* ─── Thinking Process Container ─────────────────────────────────────────── */
+.agent-thinking-process {
+  border: 1px solid color-mix(in srgb, var(--agent-agent-color) 20%, transparent);
+  border-radius: 8px;
+  overflow: hidden;
+  font-size: 12px;
+}
+
+.tp-accordion {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  background: color-mix(in srgb, var(--agent-agent-color) 6%, transparent);
+  border: none;
+  outline: none;
+  width: 100%;
+  cursor: pointer;
+  user-select: none;
+  font: inherit;
+  color: inherit;
+}
+
+.tp-chevron {
+  font-size: 16px;
+  color: var(--on-surface-variant);
+  transition: transform 0.2s ease;
+}
+
+.agent-thinking-process.tp-expanded .tp-chevron {
+  transform: rotate(180deg);
+}
+
+.tp-icon {
+  font-size: 16px;
+  color: var(--agent-agent-color);
+}
+
+.tp-status {
+  flex: 1;
+  font-size: 11px;
+  color: var(--on-surface-variant);
+  font-weight: 600;
+}
+
+/* Thinking dots animation */
+.thinking-dots {
+  display: flex;
+  gap: 2px;
+}
+
+/* Body (collapsible) — hidden by default when done */
+.tp-body {
+  max-height: 0;
+  overflow: hidden;
+  transition: max-height 0.3s ease-out;
+}
+
+.agent-thinking-process.tp-expanded .tp-body {
+  max-height: min(400px, 50vh);
+}
+
+/* Steps list */
+.tp-steps {
+  padding: 4px 0;
+}
+
+/* Individual step row */
+.tp-step {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 12px;
+  transition: opacity 0.2s ease;
+}
+
+/* Override Google Fonts default font-size: 24px with higher-specificity selectors */
+.tp-step .material-symbols-outlined {
+  font-size: 14px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.tp-live-item .material-symbols-outlined {
+  font-size: 13px;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+.tp-step-icon {
+  color: var(--on-surface-variant);
+}
+
+.tp-step-label {
+  flex: 1;
+  color: var(--on-surface);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+}
+
+/* Current step highlight */
+.tp-step-active {
+  background: color-mix(in srgb, var(--agent-agent-color) 8%, transparent);
+  animation: tp-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes tp-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+/* Completed step */
+.tp-step-done .tp-step-icon {
+  color: var(--agent-agent-color);
+}
+
+/* Expand affordance: hide chevron + disable pointer while thinking is in progress */
+.agent-thinking-process:not(.tp-done) .tp-chevron {
+  display: none;
+}
+
+.agent-thinking-process:not(.tp-done) .tp-accordion {
+  cursor: default;
+}
+
+.tp-accordion:hover {
+  background: color-mix(in srgb, var(--agent-agent-color) 10%, transparent);
+}
+
+.agent-thinking-process:not(.tp-done) .tp-accordion:hover {
+  background: color-mix(in srgb, var(--agent-agent-color) 6%, transparent);
+}
+
+/* Current step container (below history) */
+.tp-current {
+  padding: 4px 0 8px;
+  border-top: 1px solid color-mix(in srgb, var(--agent-agent-color) 10%, transparent);
+  margin-top: 4px;
+}
+
+.tp-current:empty {
+  display: none;
+  border: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* ─── Live Preview (latest 1-2 executing commands, shown in header area) ── */
+.tp-live-preview {
+  padding: 0 12px 0 16px;
+  background: color-mix(in srgb, var(--agent-agent-color) 3%, transparent);
+  border-top: 1px solid color-mix(in srgb, var(--agent-agent-color) 10%, transparent);
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 11px;
+}
+
+.tp-live-preview:empty {
+  display: none;
+  border: none;
+  padding: 0;
+}
+
+.tp-live-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 0;
+  color: var(--on-surface);
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.tp-live-item > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.tp-live-icon {
+  font-size: 13px;
+  color: var(--agent-agent-color);
+  flex-shrink: 0;
+  animation: tp-pulse 1.5s ease-in-out infinite;
+}
+
+/* ==================== Responsive Adaptations ==================== */
+
+@media (max-width: 768px) {
+  /* 终端状态栏信息项缩小间距 */
+  #terminal-wrapper .flex.gap-6 {
+    gap: 8px;
+  }
+}
+
+/* ==================== Agent Progress Extend ==================== */
+
+.agent-progress-extend {
+  border-left: 3px solid var(--accent);
+  background: var(--accent-bg);
+  font-size: 11px;
+  margin: 4px 0;
+}
+
+.agent-progress-extend .material-symbols-outlined {
+  font-size: 14px;
+  color: var(--accent);
+}
+
+.agent-progress-extend .font-bold {
+  color: var(--accent);
+}
+
+.agent-progress-extend .text-[var(--on-surface-variant)] {
+  color: var(--on-surface-variant);
+  opacity: 0.8;
 }

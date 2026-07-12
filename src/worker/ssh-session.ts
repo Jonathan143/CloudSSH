@@ -19,6 +19,7 @@ import {
   SSH_MSG_CHANNEL_WINDOW_ADJUST,
   SSH_MSG_CHANNEL_EOF,
   SSH_MSG_CHANNEL_CLOSE,
+  SSH_MSG_CHANNEL_REQUEST,
   SSH_MSG_DISCONNECT,
   SSH_MSG_IGNORE,
   SSH_MSG_DEBUG,
@@ -45,6 +46,10 @@ import { SSHAESCTRCipher, SSHAESGCMCipher, SSHHMAC } from '../ssh/crypto';
 import { SSHAuth } from '../ssh/auth';
 import { SSHChannel, type ChannelDataChunk } from '../ssh/channel';
 import { SFTPHandler } from './sftp-handler';
+import { AgentCore } from './agent/core';
+import { TerminalContext } from './agent/terminal-context';
+import { AgentExecChannel } from './agent/exec-channel';
+import type { Env } from '../types';
 
 const LOCAL_WINDOW_ADJUST_THRESHOLD = 512 * 1024;
 const KEEPALIVE_REQUEST_NAME = new TextEncoder().encode('keepalive@openssh.com');
@@ -92,6 +97,7 @@ export class SSHSession {
   private state: 'connecting' | 'version' | 'kex' | 'auth' | 'shell' | 'shell-requested' | 'ready'
     = 'connecting';
   private hostKeyFingerprint: string = '';
+  private hostKeyType: string = 'unknown';
 
   private versionRawBuffer: Uint8Array = new Uint8Array(0);
   private negotiatedCipherC2S: string = 'aes128-gcm@openssh.com';
@@ -108,13 +114,23 @@ export class SSHSession {
   private terminalSize: TerminalSize = { cols: 120, rows: 40 };
   private debugMode: boolean = false;
 
+  // Agent integration
+  private terminalContext: TerminalContext = new TerminalContext();
+  private agentCore: AgentCore | null = null;
+  private activeExecChannels: Map<number, AgentExecChannel> = new Map();
+  private confirmationResolve: ((approved: boolean) => void) | null = null;
+  private env: Env | null = null;
+  private userId: string | null = null;
+
   constructor(
     ws: WebSocket,
     socket: any,
     config: SSHConnectionConfig,
     strictHostKeyVerify: boolean = true,
     debugMode: boolean = false,
-    sftpAttachUrl?: string
+    sftpAttachUrl?: string,
+    env?: Env,
+    userId?: string,
   ) {
     this.ws = ws;
     this.socket = socket;
@@ -122,6 +138,8 @@ export class SSHSession {
     this.strictHostKeyVerify = strictHostKeyVerify;
     this.debugMode = debugMode;
     this.sftpAttachUrl = sftpAttachUrl;
+    this.env = env || null;
+    this.userId = userId || null;
 
     this.transport = new SSHTransport();
     this.packetParser = new SSHPacketParser();
@@ -614,32 +632,38 @@ export class SSHSession {
     const hHex = Array.from(H).map(b => b.toString(16).padStart(2, '0')).join('');
     this.sendDebug(`Exchange hash H=${hHex}`);
 
+    // Extract host key algorithm type from the blob
+    try {
+      const ktLen = (hostKey[0] << 24) | (hostKey[1] << 16) | (hostKey[2] << 8) | hostKey[3];
+      this.hostKeyType = this.textDecoder.decode(hostKey.subarray(4, 4 + ktLen));
+    } catch {
+      this.hostKeyType = 'unknown';
+    }
+
     // Compute host key fingerprint (SHA-256)
     const fpHash = new Uint8Array(await crypto.subtle.digest('SHA-256', hostKey));
     this.hostKeyFingerprint = 'SHA256:' + btoa(String.fromCharCode(...fpHash)).replace(/=+$/, '');
-    this.sendDebug(`Host key fingerprint: ${this.hostKeyFingerprint}`);
+    this.sendDebug(`Host key fingerprint: ${this.hostKeyFingerprint} (${this.hostKeyType})`);
 
     // --- known_hosts verification (TOFU) ---
-    // Send fingerprint to frontend for storage
+    // Send fingerprint with key type to frontend for storage
     try {
-      this.ws.send(JSON.stringify({ type: 'host_key', fingerprint: this.hostKeyFingerprint }));
+      this.ws.send(JSON.stringify({ type: 'host_key', fingerprint: this.hostKeyFingerprint, keyType: this.hostKeyType }));
     } catch (e) { /* ws closed */ }
 
     // Compare against expected fingerprint if provided
     if (this.config.expectedFingerprint) {
       if (this.config.expectedFingerprint !== this.hostKeyFingerprint) {
-        this.sendError(
-          `主机密钥指纹不匹配！可能存在中间人攻击。\n` +
-          `已知指纹: ${this.config.expectedFingerprint}\n` +
-          `实际指纹: ${this.hostKeyFingerprint}\n` +
-          `连接已阻断。如需信任新密钥，请清除该服务器的 known_hosts 记录后重试。`
-        );
+        this.sendError('主机密钥指纹变更！请确认是否为预期行为。');
+        this.sendError(`已知指纹: ${this.config.expectedFingerprint}`);
+        this.sendError(`实际指纹: ${this.hostKeyFingerprint} (${this.hostKeyType})`);
+        this.sendError('连接已阻断。如需信任新密钥，请在服务器列表中删除该服务器的已知主机记录后重试。');
         this.close();
         return;
       }
-      this.sendStatus(`主机密钥验证通过 ✓`);
+      this.sendStatus(`主机密钥验证通过 (${this.hostKeyType}) ✓`);
     } else {
-      this.sendStatus(`服务器指纹: ${this.hostKeyFingerprint}（首次连接，已记录）`);
+      this.sendStatus(`服务器指纹: ${this.hostKeyFingerprint} (${this.hostKeyType})（首次连接，已记录）`);
     }
 
     // Verify host key signature to confirm exchange hash is correct
@@ -992,6 +1016,13 @@ export class SSHSession {
           this.sendDebug(`SFTP channel confirmed, sending subsystem request`);
           const subsystemReq = channel.buildSubsystemRequest('sftp');
           await this.sendEncrypted(subsystemReq);
+        } else {
+          // Exec channel: send exec request
+          const execCh = this.activeExecChannels.get(channelID);
+          if (execCh) {
+            execCh.onOpenConfirmation();
+            this.sendDebug(`Exec channel confirmed: channelID=${channelID}`);
+          }
         }
         break;
       }
@@ -1011,6 +1042,14 @@ export class SSHSession {
           this.sendDebug(`SFTP channel open failed: reason=${reasonCode}, desc=${description}`);
           this.sendSFTPError('init', '服务器不支持 SFTP: ' + description);
           this.sftpHandler = null;
+        } else if (this.isExecChannel(channelID)) {
+          // Exec channel open failed - reject just this command, keep SSH session alive
+          const execCh = this.activeExecChannels.get(channelID);
+          if (execCh) {
+            execCh.onChannelOpenFailure(reasonCode, description);
+            this.activeExecChannels.delete(channelID);
+          }
+          this.sendDebug(`Exec channel open failed: channelID=${channelID}, reason=${reasonCode}, desc=${description}`);
         } else {
           // Shell channel failed - close connection
           this.sendError('通道打开被拒绝');
@@ -1051,6 +1090,13 @@ export class SSHSession {
               this.sendSFTPError('init', 'SFTP 初始化失败: ' + errMsg);
             }
           });
+        } else {
+          // Exec channel success — could be exec request confirmed or exit-status
+          // Try to parse exit-status from payload
+          const execCh = this.activeExecChannels.get(channelID);
+          if (execCh) {
+            this.sendDebug(`Exec channel success: channelID=${channelID}`);
+          }
         }
         break;
       }
@@ -1089,12 +1135,22 @@ export class SSHSession {
           const outputData = channel.handleChannelData(payload);
           try { this.ws.send(outputData); } catch (e) { this.sendDebug(() => `Send shell output failed: ${e instanceof Error ? e.message : e}`); }
           this.queueLocalWindowAdjust(outputData.length, channel);
+          // Feed terminal context for Agent
+          try { this.terminalContext.appendOutput(this.textDecoder.decode(outputData)); } catch {}
         } else if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
           // SFTP channel data - forward to SFTP handler
           const sftpData = channel.handleChannelData(payload);
           this.sendDebug(() => `SFTP CHANNEL_DATA received: channelID=${channelID}, dataLen=${sftpData.length}, firstByte=${sftpData[0]}`);
           this.sftpHandler.onChannelData(sftpData);
           this.queueLocalWindowAdjust(sftpData.length, channel);
+        } else {
+          // Exec channel data (Agent)
+          const execCh = this.activeExecChannels.get(channelID);
+          if (execCh) {
+            const execData = channel.handleChannelData(payload);
+            execCh.onData(execData);
+            this.queueLocalWindowAdjust(execData.length, channel);
+          }
         }
         break;
       }
@@ -1114,8 +1170,19 @@ export class SSHSession {
           const stderrData = payload.subarray(offset, offset + dataLen);
           try { this.ws.send(stderrData); } catch (e) { this.sendDebug(() => `Send stderr output failed: ${e instanceof Error ? e.message : e}`); }
           this.queueLocalWindowAdjust(stderrData.length, channel);
+        } else {
+          // Exec channel extended data (stderr for Agent)
+          const execCh = this.activeExecChannels.get(channelID);
+          if (execCh) {
+            let offset = 1 + 4;
+            offset += 4; // skip dataTypeCode
+            const dataLen = (payload[offset] << 24) | (payload[offset+1] << 16) | (payload[offset+2] << 8) | payload[offset+3];
+            offset += 4;
+            const stderrData = payload.subarray(offset, offset + dataLen);
+            execCh.onExtendedData(stderrData);
+            this.queueLocalWindowAdjust(stderrData.length, channel);
+          }
         }
-        // SFTP channel extended data is rare, just ignore
         break;
       }
 
@@ -1140,13 +1207,17 @@ export class SSHSession {
           this.sendStatus('会话已结束');
           this.close(true);
         } else {
-          // Other channel (SFTP etc.) EOF - don't close connection
+          // Other channel EOF
           this.sendDebug(`Non-shell channel EOF: channelID=${channelID}`);
           if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
             this.sftpHandler.onChannelEof();
             this.sftpHandler.dispose();
             this.sftpHandler = null;
             this.channels.delete(channelID);
+          }
+          const execCh = this.activeExecChannels.get(channelID);
+          if (execCh) {
+            execCh.onEof();
           }
         }
         break;
@@ -1159,12 +1230,57 @@ export class SSHSession {
           this.sendStatus('会话已结束');
           this.close(true);
         } else {
-          // Other channel (SFTP etc.) closed - clean up that channel only
+          // Other channel closed
           this.sendDebug(`Non-shell channel closed: channelID=${channelID}`);
+
+          // Reply CLOSE if we haven't sent it yet (RFC 4254 §5.3)
+          const channel = this.channels.get(channelID);
+          if (channel && !channel.isClosed()) {
+            try {
+              await this.sendEncrypted(channel.buildClose());
+            } catch {
+              // Ignore send errors during close
+            }
+          }
+
           this.channels.delete(channelID);
           if (this.sftpHandler && channelID === this.sftpHandler.getChannelID()) {
             this.sftpHandler.onChannelClosed();
             this.sftpHandler = null;
+          }
+          const execCh = this.activeExecChannels.get(channelID);
+          if (execCh) {
+            execCh.onClose();
+            this.activeExecChannels.delete(channelID);
+          }
+        }
+        break;
+      }
+
+      case SSH_MSG_CHANNEL_REQUEST: {
+        // Parse server-initiated CHANNEL_REQUEST (e.g., exit-status for exec channels)
+        const reqChannelID = this.getChannelIDFromPayload(payload);
+        let offset = 5; // skip msgType + channelID
+        const reqTypeLen = (payload[offset] << 24) | (payload[offset+1] << 16) | (payload[offset+2] << 8) | payload[offset+3];
+        offset += 4;
+        const reqType = this.textDecoder.decode(payload.subarray(offset, offset + reqTypeLen));
+        offset += reqTypeLen;
+        offset += 1; // skip want_reply
+
+        if (reqType === 'exit-status') {
+          const execCh = this.activeExecChannels.get(reqChannelID);
+          if (execCh) {
+            const exitCode = (payload[offset] << 24) | (payload[offset+1] << 16) | (payload[offset+2] << 8) | payload[offset+3];
+            execCh.onExitStatus(exitCode);
+            this.sendDebug(`Exec channel exit-status: channelID=${reqChannelID}, exitCode=${exitCode}`);
+          }
+        } else if (reqType === 'exit-signal') {
+          const execCh = this.activeExecChannels.get(reqChannelID);
+          if (execCh) {
+            // According to RFC 4254 §6.10, exit-signal contains: string signal name, boolean core dumped, string error message...
+            // We set a non-zero exit code (e.g., 1) to represent abnormal termination, avoiding incorrect 4-byte parsing.
+            execCh.onExitStatus(1);
+            this.sendDebug(`Exec channel exit-signal received: channelID=${reqChannelID}`);
           }
         }
         break;
@@ -1196,6 +1312,14 @@ export class SSHSession {
         }
         if (parsed.type === 'resize') {
           await this.handleResize(parsed.cols, parsed.rows);
+          return;
+        }
+
+        // Agent messages
+        // agent_stop / agent_confirm 已由 durable-object.ts 在 webSocketMessage 入口
+        // 提前拦截并通过 handleAgentControl 同步处理，不再到达此处。
+        if (parsed.type === 'agent_start') {
+          await this.handleAgentStart(parsed.message, parsed.user_id);
           return;
         }
 
@@ -1562,6 +1686,204 @@ export class SSHSession {
     }
   }
 
+  // ==================== Agent Integration ====================
+
+  private async handleAgentStart(userMessage: string, userId?: string): Promise<void> {
+    if (this.state !== 'ready') {
+      this.sendAgentFrame({ type: 'agent_frame', subType: 'error', message: 'SSH 连接未就绪' });
+      return;
+    }
+
+    // Securely verify userId. Always use the authenticated session userId (this.userId).
+    // Reject requests if client provides a conflicting userId.
+    if (userId && this.userId && userId !== this.userId) {
+      this.sendAgentFrame({ type: 'agent_frame', subType: 'error', message: '用户身份不匹配，越权操作已被拦截' });
+      return;
+    }
+
+    const effectiveUserId = this.userId;
+    if (!effectiveUserId) {
+      this.sendAgentFrame({ type: 'agent_frame', subType: 'error', message: '需要登录用户才能使用 AI 助手' });
+      return;
+    }
+
+    if (this.agentCore?.getStatus() === 'running') {
+      this.sendAgentFrame({ type: 'agent_frame', subType: 'error', message: 'Agent 正在运行中，请先停止当前任务' });
+      return;
+    }
+
+    if (!this.agentCore) {
+      this.agentCore = new AgentCore(
+        this.terminalContext,
+        (msg: any) => this.sendAgentFrame(msg),
+        async (uid: string) => this.fetchAgentAIConfig(uid),
+        async (command: string, timeout: number, signal?: AbortSignal) => this.executeAgentCommand(command, timeout, signal),
+        async (command: string, reason: string) => this.askAgentConfirmation(command, reason),
+      );
+    }
+
+    void this.agentCore.handleAgentStart(effectiveUserId, userMessage);
+  }
+
+  /**
+   * 处理 Agent 控制消息（confirm/stop），绕过被 handleAgentStart 阻塞的 WebSocket handler。
+   * 这些消息由 durable-object.ts 在调用 handleWebSocketMessage 之前提前路由。
+   */
+  handleAgentControl(type: string, msg: any): void {
+    if (type === 'agent_confirm') {
+      if (this.confirmationResolve) {
+        this.confirmationResolve(msg.approved === true);
+        this.confirmationResolve = null;
+      }
+      return;
+    }
+    if (type === 'agent_stop') {
+      this.agentCore?.agentAbort();
+      return;
+    }
+  }
+
+  private async fetchAgentAIConfig(userId: string): Promise<{ base_url: string; model: string; api_key: string } | null> {
+    if (!this.env) return null;
+    try {
+      const stub = this.env.USER_DB.get(this.env.USER_DB.idFromName('global'));
+      const res = await stub.fetch(
+        new Request(`http://internal/internal/ai-config/decrypt?user_id=${userId}`)
+      );
+      if (!res.ok) return null;
+      return await res.json() as { base_url: string; model: string; api_key: string };
+    } catch {
+      return null;
+    }
+  }
+
+  private async executeAgentCommand(
+    command: string,
+    timeout: number,
+    signal?: AbortSignal,
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    const channelID = this.nextChannelID++;
+    const channel = new SSHChannel();
+    this.channels.set(channelID, channel);
+
+    const execCh = new AgentExecChannel(channelID, channel);
+    this.activeExecChannels.set(channelID, execCh);
+
+    // Open channel
+    const openMsg = channel.buildOpenSession(channelID);
+    await this.sendEncrypted(openMsg);
+
+    try {
+      // Wait for channel open confirmation (via execCh state flags, not this.channels map)
+      const opened = await this.waitForExecChannelOpen(execCh, channel, command);
+
+      if (!opened) {
+        // Open rejected — closedPromise already resolved with error struct; await it
+        return await execCh.getClosedPromise();
+      }
+
+      // Open succeeded — send exec request
+      const execReq = channel.buildExecRequest(command);
+      await this.sendEncrypted(execReq);
+
+      // Wait for result with timeout + abort
+      let aborted = false;
+      const result = await Promise.race([
+        execCh.getClosedPromise(),
+        new Promise<{ stdout: string; stderr: string; exitCode: number }>((_, reject) => {
+          const timer = setTimeout(() => reject(new Error(`Exec timeout after ${timeout}ms`)), timeout);
+          signal?.addEventListener('abort', () => {
+            aborted = true;
+            clearTimeout(timer);
+            reject(new Error('Exec aborted'));
+          }, { once: true });
+        }),
+      ]);
+
+      // Cleanup: send EOF + CLOSE to server (RFC 4254 §5.3)
+      // Always attempt cleanup, even on abort, to prevent resource leaks
+      if (!channel.isClosed()) {
+        try {
+          await this.sendEncrypted(channel.buildEof());
+          await this.sendEncrypted(channel.buildClose());
+        } catch {
+          // Channel may already be closed by server, ignore
+        }
+      }
+
+      // If aborted, also close the exec channel to resolve any pending promises
+      if (aborted) {
+        execCh.onClose();
+      }
+
+      return result;
+    } finally {
+      // 无论成功、失败、超时或被中止，都必须清理 channel 引用，防止资源泄漏
+      // （之前 waitForExecChannelOpen 超时 throw 会跳过清理，导致 execCh 残留在 activeExecChannels）
+      this.activeExecChannels.delete(channelID);
+      this.channels.delete(channelID);
+    }
+  }
+
+  private waitForExecChannelOpen(execCh: AgentExecChannel, channel: SSHChannel, command: string): Promise<boolean> {
+    return new Promise((resolve, reject) => {
+      const start = Date.now();
+      const timeout = 5000;
+
+      const check = () => {
+        // Open rejected by server — return false, caller will await closedPromise
+        if (execCh.isOpenFailed()) {
+          resolve(false);
+          return;
+        }
+
+        // Open succeeded — return true, caller will send exec request
+        if (execCh.isOpenConfirmed() || channel.getRemoteChannelID() !== 0) {
+          resolve(true);
+          return;
+        }
+
+        // Timeout — reject with error
+        if (Date.now() - start > timeout) {
+          reject(new Error(`Exec channel open timeout (5s) for command: ${command}`));
+          return;
+        }
+
+        setTimeout(check, 50);
+      };
+
+      check();
+    });
+  }
+
+  /**
+   * 等待用户确认/取消。DO 防 Hibernate 由 AgentCore.runLoopKeepAlive 统一保活，
+   * 此处只需注册 resolve 回调即可。
+   */
+  private askAgentConfirmation(command: string, reason: string): Promise<boolean> {
+    return new Promise((resolve) => {
+      this.confirmationResolve = resolve;
+      this.sendAgentFrame({
+        type: 'agent_frame',
+        subType: 'confirm_required',
+        command,
+        reason,
+      });
+    });
+  }
+
+  private isExecChannel(channelID: number): boolean {
+    return this.activeExecChannels.has(channelID);
+  }
+
+  private sendAgentFrame(msg: any): void {
+    try {
+      if (this.ws.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify(msg));
+      }
+    } catch {}
+  }
+
   close(normal: boolean = false): void {
     if (this.keepaliveInterval) {
       clearInterval(this.keepaliveInterval);
@@ -1578,6 +1900,17 @@ export class SSHSession {
     if (this.sftpHandler) {
       this.sftpHandler.dispose();
       this.sftpHandler = null;
+    }
+    // Cleanup agent
+    this.agentCore?.agentAbort();
+    this.agentCore = null;
+    for (const [, execCh] of this.activeExecChannels) {
+      execCh.onClose();
+    }
+    this.activeExecChannels.clear();
+    if (this.confirmationResolve) {
+      this.confirmationResolve(false);
+      this.confirmationResolve = null;
     }
     this.channels.clear();
     this.channelDataQueue = [];

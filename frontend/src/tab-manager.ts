@@ -1,5 +1,6 @@
 import { SSHTerminal, SSHConnectionConfig, THEMES } from './terminal';
 import { SFTPPanel } from './sftp-panel';
+import { AgentPanel } from './agent/agent-panel';
 
 export type TabState = 'connecting' | 'connected' | 'disconnected';
 
@@ -8,6 +9,7 @@ export interface TabInfo {
   label: string;
   terminal: SSHTerminal;
   sftpPanel: SFTPPanel | null;
+  agentPanel: AgentPanel | null;
   containerEl: HTMLElement;
   hostInfo?: { host: string; port: number; username?: string };
   state: TabState;
@@ -28,6 +30,7 @@ export class TabManager {
   private tabBarEl: HTMLElement;
   private terminalAreaEl: HTMLElement;
   private tabCounter = 0;
+  private _isLoggedIn: boolean = false;
 
   /** 当所有标签都被关闭时触发，外部可以用它来回到连接页面 */
   private onAllTabsClosed?: () => void;
@@ -35,6 +38,10 @@ export class TabManager {
   constructor(tabBarId: string, terminalAreaId: string) {
     this.tabBarEl = document.getElementById(tabBarId)!;
     this.terminalAreaEl = document.getElementById(terminalAreaId)!;
+  }
+
+  setLoggedIn(loggedIn: boolean): void {
+    this._isLoggedIn = loggedIn;
   }
 
   setAllTabsClosedHandler(handler: () => void): void {
@@ -46,15 +53,21 @@ export class TabManager {
   createTab(label: string, hostInfo?: { host: string; port: number; username?: string }): TabInfo {
     const id = `tab-${++this.tabCounter}-${Date.now()}`;
 
-    // 创建终端容器
+    // 创建终端容器（flex 布局，支持 AgentPanel 右侧分栏）
     const containerEl = document.createElement('div');
     containerEl.id = `terminal-container-${id}`;
-    containerEl.className = 'absolute inset-0 overflow-hidden';
+    containerEl.className = 'absolute inset-0 overflow-hidden flex flex-row';
     containerEl.style.display = 'none';
     this.terminalAreaEl.appendChild(containerEl);
 
-    // 创建 SSHTerminal 实例
-    const terminal = new SSHTerminal(containerEl.id);
+    // 内部终端包装器（flex-1 占满剩余空间）
+    const terminalInner = document.createElement('div');
+    terminalInner.id = `terminal-inner-${id}`;
+    terminalInner.className = 'flex-1 min-w-0 relative overflow-hidden';
+    containerEl.appendChild(terminalInner);
+
+    // 创建 SSHTerminal 实例（挂在内部包装器上）
+    const terminal = new SSHTerminal(terminalInner.id);
 
     // 设置会话关闭回调
     terminal.setSessionClosedHandler(() => {
@@ -71,10 +84,15 @@ export class TabManager {
           tab.sftpPanel.dispose();
           tab.sftpPanel = null;
         }
+        // 清理该标签的 Agent 面板
+        if (tab.agentPanel) {
+          tab.agentPanel.dispose();
+          tab.agentPanel = null;
+        }
       }
     });
 
-    // 设置 SSH 就绪回调：初始化 SFTP 面板
+    // 设置 SSH 就绪回调：初始化 SFTP 面板 + Agent 面板
     terminal.setSessionReadyHandler(() => {
       const tab = this.tabs.get(id);
       if (tab) {
@@ -90,6 +108,18 @@ export class TabManager {
           tab.sftpPanel.bindEvents();
         }
         tab.sftpPanel.handleSSHReady();
+
+        // 初始化 Agent 面板（仅登录用户）
+        if (this._isLoggedIn && !tab.agentPanel) {
+          tab.agentPanel = new AgentPanel(tab.containerEl, true);
+          tab.agentPanel.render();
+          tab.agentPanel.setWebSocketSend((data: string) => tab.terminal.sendWebSocketMessage(data));
+          tab.terminal.setAgentFrameHandler((msg: any) => {
+            tab.agentPanel?.handleAgentFrame(msg);
+          });
+          // AgentPanel 展开/收起时触发终端重新适配尺寸
+          tab.agentPanel.setLayoutChangeHandler(() => tab.terminal.fit());
+        }
       }
     });
 
@@ -111,6 +141,7 @@ export class TabManager {
       label,
       terminal,
       sftpPanel: null,
+      agentPanel: null,
       containerEl,
       hostInfo,
       state: 'connecting',
@@ -160,6 +191,10 @@ export class TabManager {
     if (tab.sftpPanel) {
       tab.sftpPanel.dispose();
       tab.sftpPanel = null;
+    }
+    if (tab.agentPanel) {
+      tab.agentPanel.dispose();
+      tab.agentPanel = null;
     }
     tab.terminal.dispose();
     tab.containerEl.remove();

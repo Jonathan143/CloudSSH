@@ -14,6 +14,7 @@
     <a href="#features">Features</a> ·
     <a href="#quick-start">Deployment</a> ·
     <a href="#architecture">Architecture</a> ·
+    <a href="CHANGELOG.md">Changelog</a> ·
     <a href="#license">License</a>
   </p>
   <p>
@@ -29,9 +30,14 @@
 
 > Imagine opening your browser anytime, anywhere, and connecting to your server with a highly futuristic cyberpunk UI, without installing any SSH client.
 
-![Demo 1](./demo1.png)
-![Demo 2](./demo2.png)
-![Demo 3](./demo3.png)
+<div align="center">
+  <a href="https://www.bilibili.com/video/BV1UgMt6UEdF" target="_blank" title="Click to play video">
+    <img src="https://i1.hdslb.com/bfs/archive/28a55cf05e4b5608e7ee0345b043e7ea97c81ed7.jpg" alt="CloudSSH Demo Video" width="720" />
+    <br/>
+    <img src="https://img.shields.io/badge/%E2%96%B6_Click_to_Play_Video-00A1D6?style=for-the-badge&logo=bilibili&logoColor=white" alt="Play" />
+  </a>
+  <p><sub>Video duration 8:27 · Full CloudSSH walkthrough</sub></p>
+</div>
 
 ## Table of Contents
 
@@ -79,7 +85,7 @@
 - **Multiple Auth Methods**: Supports standard SSH password authentication as well as Ed25519 plaintext private key authentication.
 - **MitM Protection (TOFU)**: Automatically extracts and prints the server's Host Key (SHA-256 fingerprint) on the first connection, supporting Ed25519/ECDSA/RSA signature verification, and caches known host keys locally and via API to prevent MitM on future connections.
 - **Geek Terminal Experience**: Powered by `@xterm/xterm` and the `@xterm/addon-webgl` hardware acceleration rendering engine, ensuring silky smooth scrolling even with massive log outputs.
-- **Customizable UI**: All colors are powered by a CSS variable system, with built-in Cyberpunk, Glacier, and Gruvbox themes switchable in one click. Supports importing custom JSON theme files (auto-synced to the cloud for logged-in users, working across browsers), with a companion [Visual Theme Editor](https://newbietan.github.io/CloudSSH/) for live color customization and export. Fully optimized for mobile devices.
+- **Customizable UI**: All colors are powered by a CSS variable system, with built-in Cyberpunk, Glacier, and Gruvbox themes switchable in one click. The companion [Visual Theme Editor](https://newbietan.github.io/CloudSSH/) provides live color customization with full preview areas (login page, server list, terminal + SFTP, AI Agent panel), JSON theme export, and cloud sync for logged-in users across browsers. Fully optimized for mobile devices.
 - **SFTP Graphical File Manager**: Integrated with a complete SFTP v3 file transfer protocol, providing a graphical file browser interface. Supports directory browsing, file upload/download, creating new folders, file renaming, and deletion. Built on SSH subsystem, running in parallel with terminal sessions without interference, supporting concurrent downloads and upload cancellation.
 - **Native File Transfer**: Integrated with [trzsz.js](https://github.com/trzsz/trzsz.js), supporting `trz` (upload) / `tsz` (download) commands for file transfer, fully compatible with tmux sessions. Also supports drag-and-drop file upload to the terminal, directory transfer, and resumable transfers. (Requires [trzsz](https://trzsz.github.io/) installed on the remote server)
 - **GitHub OAuth Integration**: Supports GitHub login, allowing users to save and manage frequently used SSH servers for one-click connections.
@@ -88,6 +94,7 @@
 - **Dual-Segment Latency & Colo Display**: Instantly and periodically monitor WebSocket RTT (client to CF), physical latency (CF to SSH host), and the current Cloudflare datacenter code (e.g. `CF-LAX`) on the status bar.
 - **In-Terminal Text Search**: Real-time log search support via `Ctrl+Shift+F`.
 - **Terminal Log Export**: Download the entire screen buffer of the active terminal session as a `.txt` file with a single click on the header download button, avoiding browser freezes when selecting long logs.
+- **AI Agent Assistant**: Built-in AI Agent sidebar with BYOK (Bring Your Own Key) support for OpenAI-compatible APIs (e.g., DeepSeek). Provides 8 specialized operations tools: execute commands, read terminal context, detect server environment, list processes, manage systemctl services, manage Docker containers, user confirmation, and structured report output. Supports LLM streaming output (character-by-character display). Dangerous commands are automatically blocked or require user confirmation. **Thinking Process Container**: During multi-step tasks, displays the latest 1-2 commands in real-time, auto-collapses with total step count after completion, expands to show full execution history.
 
 <a id="architecture"></a>
 ## Architecture
@@ -99,25 +106,30 @@ flowchart TB
     subgraph "Browser Client"
         UI["Frontend UI<br/>TypeScript + xterm.js"]
         SFTP["SFTP File Manager"]
+        Agent["AI Agent Assistant"]
         Trzsz["trzsz File Transfer"]
     end
-    
+
     subgraph "Cloudflare Edge Network"
         Worker["Worker<br/>Routing + API"]
         SSH_DO["SSHSessionDO<br/>SSH Session Management"]
         User_DO["UserDBDO<br/>User Data Management"]
+        AgentCore["AgentCore<br/>AI Control Loop"]
     end
-    
+
     subgraph "Target Server"
-        SSH["SSH Server<br/>(OpenSSH/Dropbear)"
+        SSH["SSH Server<br/>(OpenSSH/Dropbear)"]
     end
 
     UI <-->|"WebSocket<br/>Terminal I/O"| Worker
     SFTP <-->|"WebSocket<br/>SFTP Data"| Worker
+    Agent <-->|"WebSocket<br/>Agent Messages"| Worker
     Trzsz <-->|"trzsz Protocol"| UI
     Worker <-->|"WebSocket"| SSH_DO
     Worker <-->|"Internal API"| User_DO
     SSH_DO <-->|"TCP Socket<br/>@cloudflare/sockets"| SSH
+    SSH_DO <-->|"Exec Channel"| AgentCore
+    AgentCore <-->|"LLM API"| External["External LLM Service"]
 ```
 
 ### Core Components
@@ -134,6 +146,11 @@ flowchart TB
 | **Frontend Terminal** | `frontend/src/terminal.ts` | xterm.js wrapper, dynamic RTT heartbeats, terminal search, and WebSocket management |
 | **Tab Manager** | `frontend/src/tab-manager.ts` | Single-page tab and session coordinator for independent terminals and SFTP panels |
 | **SFTP Panel** | `frontend/src/sftp-panel.ts` | Graphical file manager UI with upload/download queue and cancellation support |
+| **AI Agent** | `src/worker/agent/core.ts` | AI control loop: LLM streaming calls, tool execution, environment detection, terminal context reading |
+| **Agent Tools** | `src/worker/agent/tools.ts` | 8 operations tools (execute command, terminal context, environment detection, process list, service management, Docker management, user confirmation, report output) |
+| **Agent Safety** | `src/worker/agent/safety.ts` | Two-layer security: direct blocking (rm -rf /, fork bomb, etc.) + confirmation prompts (rm, shutdown, iptables, etc.) |
+| **Agent Panel** | `frontend/src/agent/agent-panel.ts` | AI assistant sidebar UI with streaming output, Markdown rendering, collapsible thinking process container, and confirmation dialogs |
+| **AI Config** | `frontend/src/ai-config.ts` | AI model configuration modal for Base URL / API Key / model selection |
 
 ### SSH Protocol Implementation
 
@@ -157,6 +174,7 @@ This project implements a complete SSH-2.0 protocol stack:
 4. SSHSession executes the complete SSH protocol negotiation (version exchange → key exchange → authentication → channel open → PTY → Shell).
 5. Encrypted terminal data is bidirectionally forwarded between the frontend and SSH server via WebSocket.
 6. SFTP file management runs on a separate SSH subsystem channel, supporting directory browsing, file upload/download, and other operations.
+7. The AI Agent receives user messages via WebSocket, AgentCore calls the external LLM API, executes commands through SSH exec channels, and streams results back to the frontend.
 
 <a id="quick-start"></a>
 ## Quick Deployment
@@ -170,6 +188,13 @@ This project implements a complete SSH-2.0 protocol stack:
 ### Steps
 
 #### Method 1: Deploy via GitHub Integration (Recommended)
+
+<div align="center">
+  <a href="https://dash.cloudflare.com/?url=https://github.com/newbietan/CloudSSH">
+    <img src="https://img.shields.io/badge/Deploy_to_Cloudflare-FF6633?style=for-the-badge&logo=cloudflare&logoColor=white" alt="Deploy to Cloudflare">
+  </a>
+  <p>Click the button to jump to the Cloudflare console — authorize your GitHub account and deploy automatically, no local environment required</p>
+</div>
 
 1. **Fork this repository** to your GitHub account.
 2. **Create Worker App**: Log in to Cloudflare, go to Workers & Pages, click Create Application, connect your GitHub account, and select the forked repository.
@@ -214,7 +239,7 @@ This project implements a complete SSH-2.0 protocol stack:
 | Production | `pnpm run deploy` | `cloudssh.<subdomain>.workers.dev` | main branch code |
 | Test | `pnpm run deploy:test` | `cloudssh-test.<subdomain>.workers.dev` | test branch code, DO data isolated from production |
 
-> **Note**: Both environments bind to Durable Objects with the same `class_name`, sharing data completely. After deployment, you can bind different custom domains for each environment in the Cloudflare Dashboard (Settings → Domains & Routes).
+> **Note**: Both environments bind to Durable Objects with the same `class_name`, but data is completely isolated due to different Worker names. After deployment, you can bind different custom domains for each environment in the Cloudflare Dashboard (Settings → Domains & Routes).
 
 #### Optional: Configure Turnstile Human Verification
 
@@ -352,6 +377,7 @@ test branch (dev/test)  ──merge──>  main branch (production)
 | **Frontend** | TypeScript + Vite + xterm.js | Web terminal emulator, WebGL hardware acceleration |
 | **UI Framework** | Tailwind CSS (CDN) + CSS Variable Theme System | Switchable built-in themes, custom JSON theme import with cloud sync |
 | **File Transfer** | trzsz.js | Supports trz/tsz commands, drag-and-drop upload, resumable transfers |
+| **AI Assistant** | BYOK + OpenAI-compatible API | Bring your own API key, supports DeepSeek and other compatible models |
 | **Backend** | Cloudflare Workers | Serverless edge computing |
 | **Session Management** | Durable Objects | SSH session isolation, Hibernation API |
 | **Data Storage** | Durable Objects SQLite | User data, server configurations |
@@ -368,10 +394,10 @@ Issues and Pull Requests are welcome to help build the community. If you find th
 
 ## Star History
 
-<a href="https://www.star-history.com/?type=date&repos=newbietan%2FCloudSSH">
+<a href="https://www.star-history.com/?repos=newbietan%2FCloudSSH&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=newbietan/CloudSSH&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=newbietan/CloudSSH&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=newbietan/CloudSSH&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=newbietan/CloudSSH&type=date&theme=dark&legend=top-left&sealed_token=W6EXioqdcb2BEJNCLBVZIvRGDUYCaxki-xY1FfDVex2S8hS-ABAc84mDRxLIx0wQLFCd3Wh_p-t4bD4yT_iPkhi0_7Aciixag0Vj0_Qsqv3Wh_pbiD6Ykw" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=newbietan/CloudSSH&type=date&legend=top-left&sealed_token=W6EXioqdcb2BEJNCLBVZIvRGDUYCaxki-xY1FfDVex2S8hS-ABAc84mDRxLIx0wQLFCd3Wh_p-t4bD4yT_iPkhi0_7Aciixag0Vj0_Qsqv3Wh_pbiD6Ykw" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=newbietan/CloudSSH&type=date&legend=top-left&sealed_token=W6EXioqdcb2BEJNCLBVZIvRGDUYCaxki-xY1FfDVex2S8hS-ABAc84mDRxLIx0wQLFCd3Wh_p-t4bD4yT_iPkhi0_7Aciixag0Vj0_Qsqv3Wh_pbiD6Ykw" />
  </picture>
 </a>
