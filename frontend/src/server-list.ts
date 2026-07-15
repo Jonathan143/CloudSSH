@@ -1,3 +1,5 @@
+import { populateRegionSelect, regionLabel } from './regions';
+
 interface UserInfo {
   id: number;
   github_id: number;
@@ -13,6 +15,8 @@ interface ServerConfig {
   port: number;
   username: string;
   auth_method: 'password' | 'publickey';
+  region?: string | null;
+  inferred_hint?: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -150,6 +154,14 @@ export class ServerList {
     const authIcon = server.auth_method === 'publickey' ? 'vpn_key' : 'password';
     const authLabel = server.auth_method === 'publickey' ? 'KEY' : 'PWD';
 
+    // 区域信息：用户手动覆盖优先，其次系统推断，都没有则显示 Auto
+    const effectiveHint = server.region || server.inferred_hint || '';
+    const isManual = !!server.region;
+    const regionLabelText = regionLabel(effectiveHint);
+    const regionTag = effectiveHint
+      ? (isManual ? '手动' : '自动')
+      : '自动';
+
     return `
       <div class="server-card p-5 relative group" id="card-${server.id}">
         <div class="absolute top-0 left-0 w-full h-[2px] bg-gradient-to-r from-transparent via-[var(--border-strong)] to-transparent group-hover:via-[var(--accent)] transition-all duration-300"></div>
@@ -173,6 +185,14 @@ export class ServerList {
           <div class="flex items-center gap-2">
             <span class="text-dim">USER</span>
             <span class="text-on-surface">${this.escapeHtml(server.username)}</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="text-dim">REGION</span>
+            <span class="text-on-surface flex items-center gap-1">
+              <span class="material-symbols-outlined" style="font-size: 11px; color: var(--accent-secondary);">${effectiveHint ? 'my_location' : 'explore'}</span>
+              ${this.escapeHtml(regionLabelText)}
+            </span>
+            <span class="text-[9px] text-dim border border-dim px-1 py-0.5 ml-0.5">${regionTag}</span>
           </div>
         </div>
 
@@ -294,6 +314,21 @@ export class ServerList {
       } else {
         this.setModalAuthMode('password');
       }
+
+      // 区域下拉：回显用户保存的 region（"" = Auto）
+      const regionSelect = document.getElementById('server-region') as HTMLSelectElement | null;
+      const inferredInfo = document.getElementById('server-region-inferred');
+      if (regionSelect) {
+        populateRegionSelect(regionSelect, server.region || '');
+      }
+      // 显示系统推断值（仅编辑时，让用户了解 DB 持久化的 hint）
+      if (inferredInfo) {
+        if (server.inferred_hint) {
+          inferredInfo.textContent = `系统推断：${regionLabel(server.inferred_hint)}`;
+        } else {
+          inferredInfo.textContent = '';
+        }
+      }
     } else {
       // 清空表单
       (document.getElementById('server-name') as HTMLInputElement).value = '';
@@ -303,6 +338,12 @@ export class ServerList {
       (document.getElementById('server-password') as HTMLInputElement).value = '';
       (document.getElementById('server-private-key') as HTMLTextAreaElement).value = '';
       this.setModalAuthMode('password');
+
+      // 新增时：region 默认 Auto，无系统推断可显示
+      const regionSelect = document.getElementById('server-region') as HTMLSelectElement | null;
+      const inferredInfo = document.getElementById('server-region-inferred');
+      if (regionSelect) populateRegionSelect(regionSelect, '');
+      if (inferredInfo) inferredInfo.textContent = '';
     }
 
     modal.classList.remove('hidden');
@@ -369,6 +410,13 @@ export class ServerList {
       const body: any = { name, host, port, username, auth_method: authMethod };
       if (credential) body.credential = credential;
 
+      // 区域偏好：空字符串表示 Auto（让系统自动推断）
+      const regionSelect = document.getElementById('server-region') as HTMLSelectElement | null;
+      if (regionSelect) {
+        body.region = regionSelect.value || '';
+      }
+
+      // 保存请求（后端在保存时会同步推断 locationHint，故时间可能略长）
       let res: Response;
       if (this.editingServerId) {
         res = await fetch(`/api/servers/${this.editingServerId}`, {
@@ -389,6 +437,30 @@ export class ServerList {
         throw new Error(err.error || 'Save failed');
       }
 
+      const responseData = await res.json() as any;
+
+      // DEBUG_MODE 时，响应中包含 _debug 字段：显示完整调试日志
+      if (responseData._debug && Array.isArray(responseData._debug)) {
+        console.log('[locationHint 调试信息]');
+        responseData._debug.forEach((msg: string) => console.log(msg));
+        this.showDebugNotification(responseData._debug);
+      }
+
+      // 非调试模式：用简短 toast 提示推断结果，让用户知道区域调度已生效
+      // POST 与 PUT 路径后端均会返回最新记录（含 inferred_hint 字段）
+      if (!responseData._debug) {
+        const inferred = responseData.inferred_hint || null;
+        const userRegion = body.region || null;
+        if (userRegion || inferred) {
+          // 用户手动指定优先显示手动值，否则显示系统推断值
+          const hint = userRegion || inferred;
+          this.showToast(`已保存，区域：${regionLabel(hint)}`, false);
+        } else {
+          // 推断失败（私网 IP / 限流 / 未命中映射表）
+          this.showToast('已保存，未能推断区域（将使用自动调度）', true);
+        }
+      }
+
       this.hideModal();
       await this.fetchServers();
     } catch (e) {
@@ -400,6 +472,84 @@ export class ServerList {
         ${this.editingServerId ? 'UPDATE_SERVER' : 'SAVE_SERVER'}
       `;
     }
+  }
+
+  // ==================== 保存反馈 toast ====================
+
+  /**
+   * 右下角简短提示气泡。warn=true 用青色表示异常场景，否则用主题绿表示正常保存。
+   * 与 DEBUG_MODE 的详细 showDebugNotification 互斥使用。
+   */
+  private showToast(text: string, warn = false): void {
+    const notification = document.createElement('div');
+    const accentColor = warn ? 'var(--accent-secondary)' : 'var(--accent)';
+    notification.className = 'fixed bottom-4 right-4 z-[200] max-w-sm p-3 px-4 rounded-lg shadow-2xl border bg-[var(--bg-surface)] text-[var(--text)] font-mono text-[11px] flex items-center gap-2';
+    notification.style.borderColor = accentColor;
+    notification.style.opacity = '0';
+    notification.style.transition = 'opacity 0.3s ease, transform 0.3s ease';
+    notification.style.transform = 'translateY(8px)';
+
+    const icon = document.createElement('span');
+    icon.className = 'material-symbols-outlined';
+    icon.style.fontSize = '16px';
+    icon.style.color = accentColor;
+    icon.textContent = warn ? 'warning' : 'check_circle';
+    notification.appendChild(icon);
+
+    const label = document.createElement('span');
+    label.className = 'text-on-surface';
+    label.textContent = text;
+    notification.appendChild(label);
+
+    document.body.appendChild(notification);
+    // 入场动画
+    requestAnimationFrame(() => {
+      notification.style.opacity = '1';
+      notification.style.transform = 'translateY(0)';
+    });
+    // 4 秒后淡出
+    setTimeout(() => {
+      notification.style.opacity = '0';
+      notification.style.transform = 'translateY(8px)';
+      setTimeout(() => notification.remove(), 300);
+    }, 4000);
+  }
+
+  // ==================== DEBUG 通知 ====================
+
+  private showDebugNotification(debugLines: string[]): void {
+    // 创建通知元素
+    const notification = document.createElement('div');
+    notification.className = 'fixed bottom-4 right-4 z-[200] max-w-md p-4 rounded-lg shadow-2xl border border-[var(--accent)] bg-[var(--bg-surface)] text-[var(--text)] font-mono text-[11px] leading-relaxed custom-scrollbar';
+    notification.style.maxHeight = '300px';
+    notification.style.overflowY = 'auto';
+
+    const title = document.createElement('div');
+    title.className = 'text-[var(--accent)] font-bold mb-2 text-xs';
+    title.textContent = '[locationHint 调试信息]';
+    notification.appendChild(title);
+
+    const content = document.createElement('div');
+    content.className = 'text-muted whitespace-pre-wrap';
+    content.textContent = debugLines.join('\n');
+    notification.appendChild(content);
+
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'absolute top-2 right-2 text-muted hover:text-[var(--accent)] cursor-pointer';
+    closeBtn.innerHTML = '<span class="material-symbols-outlined" style="font-size: 16px;">close</span>';
+    closeBtn.onclick = () => notification.remove();
+    notification.appendChild(closeBtn);
+
+    document.body.appendChild(notification);
+
+    // 8 秒后自动消失
+    setTimeout(() => {
+      if (notification.parentNode) {
+        notification.style.transition = 'opacity 0.3s';
+        notification.style.opacity = '0';
+        setTimeout(() => notification.remove(), 300);
+      }
+    }, 8000);
   }
 
   // ==================== 退出登录 ====================

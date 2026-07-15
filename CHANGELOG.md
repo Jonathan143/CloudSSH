@@ -5,6 +5,64 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.7] - 2026-07-13
+
+### Fixed
+- 修复 `bigIntMod` 大数取模卡死：RSA 私钥认证时逐字节减法循环复杂度为 O(a/m)，大密钥下无限循环。改用原生 `BigInt` 取模，O(1) 完成。
+- 修复 ECDH 共享密钥未做全零校验：不符合 RFC 5656 §4 要求，现拒绝全零共享密钥。
+- 修复 KEX_INIT 解析缺少边界检查：畸形包可导致 buffer 越界读取，现对 `length` 字段和 `offset` 做前置校验。
+- 修复 SSH 包 padding 长度未校验：缺少 `paddingLength < 4`（RFC 4253 §6 最小填充）和 `>= packetLength` 越界检查，两条解析路径均已补齐。
+- 修复 NEWKEYS 后序列号未重置：不符合 RFC 4253 §7.3 规范，现发送 NEWKEYS 后立即将 `seqNumSend` 和 `packetParser.seqNum` 归零。
+- 修复 Agent 确认等待无法被中止：`askConfirmation` 在 Agent 被停止时永久挂起，新增 `askConfirmationWithAbort` 通过 `Promise.race` 响应 abort 信号。
+- 修复终端 resize 事件监听器内存泄漏：匿名箭头函数无法 `removeEventListener`，现存储引用并在 `dispose()` 中正确移除。
+- 修复会话就绪状态依赖硬编码中文匹配：`sendStatus` 新增结构化 `event` 字段（`auth_success`/`shell_ready`），前端优先匹配事件名，向后兼容旧消息文本。
+- 修复 `user_id` 参数缺少 `isNaN` 校验：5 处内部 API 的 `parseInt` 结果未校验，可被注入非数字字符串。
+- 修复 500 错误响应泄露内部错误信息：`handleServersRoute` 的 catch 块直接返回原始 `e.message`，现统一返回 `"Internal Server Error"`。
+- 修复 `ip-geo.ts` 区域推断返回无效 `apac-ne`：非合法 Cloudflare DO locationHint，现统一为 `apac`。
+- 修复 SSH 连接配置通过 URL query param 传递的安全隐患：私钥等敏感信息会出现在 URL 日志和浏览器历史中，改用 `x-ssh-config` HTTP header 传递，同时避免 URL 长度超限。
+- 修复 LLM 输出未脱敏：Agent 工具执行结果在送入 LLM 前未过滤敏感信息，现正则脱敏 PEM 私钥、JWT、GitHub Token、AWS Key ID 四类密钥。
+
+### Added
+- 新增 WebSocket 错误日志：`webSocketError` 回调补充 `console.error` 便于排查连接异常。
+- 新增 `derivedKeyCache` 加密密钥缓存：PBKDF2 10 万次迭代开销大，缓存 `CryptoKey` 避免重复推导。
+
+## [1.0.6] - 2026-07-12
+
+### Added
+- 新增 DO locationHint 智能区域调度：保存服务器时自动通过 ipinfo.io 查询目标 IP 地理位置，推断最优 Cloudflare DO 部署区域并持久化到数据库，连接时直接读取，零运行时外部 API 调用。
+- 新增 `src/worker/ip-geo.ts`：IP 地理位置推断模块，支持 11 个 Cloudflare DO 区域（wnam/enam/sam/weur/eeur/apac/oc/afr/me 等），US/CA 按经度细分东西海岸。
+- 新增 `frontend/src/regions.ts`：共享区域选项组件，供服务器管理弹窗和匿名连接表单共用。
+- 服务器管理弹窗新增区域下拉选择器（默认"自动"），编辑时显示系统推断值。
+- 匿名连接表单新增区域高级选项（仅手动覆盖，不自动推断）。
+- DEBUG_MODE 模式下保存服务器时显示推断过程调试弹窗。
+
+### Changed
+- `servers` 表新增 `region`（用户手动覆盖）和 `inferred_hint`（系统推断持久化）两列，使用幂等 `PRAGMA table_info` 守卫安全迁移。
+- `handleAddServer` 保存时触发一次性 IP 地理推断并写入 `inferred_hint` 列。
+- `handleUpdateServer` host 变更时自动重新推断。
+- `handleConnectServer` 连接时直接读 DB 注入 `locationHint`，零运行时外部调用。
+- `handleSSHConnection` 匿名路径仅读取 URL `?region=` 参数作为手动覆盖。
+- `handleTokenSSHConnection` 从 config.locationHint 读取，经白名单校验后传入 DO `get()`。
+- 终端输入不再触发无意义的 `JSON parse failed` 噪音日志（仅对 `{` 开头的消息尝试解析）。
+- IP 地理推断 API 从 ipapi.co 切换到 ipinfo.io（免费 50k 次/月，避免 Workers 共享 IP 下的 429 限流）。
+
+### Note
+- **locationHint 是 Cloudflare 的 best-effort 特性**：Cloudflare 会尽力在指定区域实例化 DO，但不保证一定成功。当目标区域 DO 容量不足时，会 fallback 到最近的可用区域。免费计划下亚太区域 DO 容量有限，可能无法总是分配到最近节点。
+
+## [1.0.5] - 2026-07-12
+
+### Fixed
+- 修复 SSRF 防护 IPv6 绕过漏洞：`validateBaseUrl` 未剥离 `[::1]` 方括号，导致用户可将 AI base_url 指向本机 IPv6 回环地址，绕过内网拦截。
+- 修复 Agent 安全确认 `apk` 子命令漏覆盖：`needsConfirmation` 正则缺失 Alpine 系 `apk add/del`，可静默安装/卸载系统包而无需用户确认。
+- 修复 `crypto.ts` 异常路径二次崩溃：catch 块中读取 `ciphertext.length` 在 null 输入时自身 throw，导致 graceful degradation 失效。
+
+### Added
+- 完成 SSH 协议层阶段 1+2 测试覆盖，共 9 个测试文件、347 个用例，覆盖 `safety`、`ssrf`、`algorithms`、`kex`、`crypto`（100%）、`packet`（96%）、`utils`（100%）核心模块。
+- 新增 worker 接缝安全测试套件（`tests/worker/security.test.ts`，12 用例），通过路由入口验证 CSRF、IDOR 越权、SSRF 接缝、签名伪造、CSWSH 五类安全边界。
+
+### Changed
+- 将 `coverage/` 目录加入 `.gitignore`。
+
 ## [1.0.4] - 2026-07-11
 
 ### Added

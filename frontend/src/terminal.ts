@@ -16,6 +16,8 @@ export interface SSHConnectionConfig {
   authMethod?: 'password' | 'publickey';
   privateKey?: string;
   expectedFingerprint?: string;
+  /** 匿名路径手动覆盖的区域偏好（保存服务器路径不使用此字段） */
+  locationHint?: string;
 }
 
 interface ConnectOptions {
@@ -163,9 +165,11 @@ export class SSHTerminal {
   private lastPingTime: number | null = null;
   private wsLatency: number | null = null;
   private onLatencyUpdated?: (cfLatency: number | null, cfColo: string | null, wsLatency: number | null) => void;
+  private resizeListener: () => void;
 
   constructor(containerId: string) {
     this.container = document.getElementById(containerId)!;
+    this.resizeListener = () => this.fit();
 
     this.terminal = new Terminal({
       cursorBlink: true,
@@ -198,7 +202,7 @@ export class SSHTerminal {
       return true;
     });
 
-    window.addEventListener('resize', () => this.fit());
+    window.addEventListener('resize', this.resizeListener);
 
     // Right-click paste support
     this.container.addEventListener('contextmenu', async (e) => {
@@ -429,6 +433,11 @@ export class SSHTerminal {
     const wsUrl = new URL(window.location.href);
     wsUrl.protocol = wsUrl.protocol === 'https:' ? 'wss:' : 'ws:';
     wsUrl.pathname = '/api/ssh';
+    // 匿名路径：用户在前端选定 region 后作为 URL query 传给 Worker；
+    // Worker 在 get() 前读取并传入 locationHint（仅手动覆盖路径）
+    if (config.locationHint) {
+      wsUrl.searchParams.set('region', config.locationHint);
+    }
 
     return new Promise((resolve, reject) => {
       this.ws = new WebSocket(wsUrl.toString());
@@ -526,12 +535,12 @@ export class SSHTerminal {
           switch (msg.type) {
             case 'status':
               this.terminal.writeln(`\x1b[32m[*] ${msg.message}\x1b[0m`);
-              if (msg.message === '认证成功') {
+              if (msg.event === 'auth_success' || msg.message === '认证成功') {
                 this.reconnectAttempts = 0;
                 const statusText = document.getElementById('status-text');
                 if (statusText) statusText.innerHTML = '<span class="w-2 h-2 bg-[var(--accent)] inline-block animate-pulse"></span> STATUS: ONLINE';
               }
-              if (msg.message === 'Shell 已就绪') {
+              if (msg.event === 'shell_ready' || msg.message === 'Shell 已就绪') {
                 this.onSessionReady?.();
               }
               break;
@@ -751,6 +760,7 @@ export class SSHTerminal {
 
   dispose(): void {
     this.disconnect();
+    window.removeEventListener('resize', this.resizeListener);
     this.terminalDisposables.forEach(d => d.dispose());
     this.terminalDisposables = [];
     this.terminal.dispose();

@@ -1,4 +1,5 @@
-import { Env, UserInfo, ServerConfig, SSHConnectionConfig } from '../types';
+import { Env, UserInfo, ServerConfig, SSHConnectionConfig, ALLOWED_LOCATION_HINTS } from '../types';
+import { inferLocationHint, type InferResult } from './ip-geo';
 
 /**
  * UserDBDO — 用户数据库 Durable Object（全局单例）
@@ -16,6 +17,7 @@ export class UserDBDO {
   // one-time-token 内存存储：token → { config, expiresAt }
   private connectTokens: Map<string, { config: SSHConnectionConfig; expiresAt: number }> = new Map();
   private static readonly MAX_CONNECT_TOKENS = 1000;
+  private derivedKeyCache: Map<number, CryptoKey> = new Map();
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -56,6 +58,8 @@ export class UserDBDO {
         username    TEXT NOT NULL,
         credential  TEXT NOT NULL,
         auth_method TEXT DEFAULT 'password',
+        region      TEXT DEFAULT NULL,
+        inferred_hint TEXT DEFAULT NULL,
         created_at  TEXT DEFAULT (datetime('now')),
         updated_at  TEXT DEFAULT (datetime('now'))
       );
@@ -98,6 +102,16 @@ export class UserDBDO {
         updated_at     TEXT DEFAULT (datetime('now'))
       );
     `);
+
+    // === Migration: 给既有 servers 表追加 region / inferred_hint 列（幂等） ===
+    // SQLite 没有 ADD COLUMN IF NOT EXISTS，用 PRAGMA table_info 守卫
+    const serverCols = this.db.exec("PRAGMA table_info(servers)").toArray();
+    if (!serverCols.some((c: any) => c.name === 'region')) {
+      this.db.exec("ALTER TABLE servers ADD COLUMN region TEXT DEFAULT NULL");
+    }
+    if (!serverCols.some((c: any) => c.name === 'inferred_hint')) {
+      this.db.exec("ALTER TABLE servers ADD COLUMN inferred_hint TEXT DEFAULT NULL");
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -123,9 +137,11 @@ export class UserDBDO {
 
       // --- 服务器 CRUD ---
       if (path === '/internal/servers' && request.method === 'GET') {
-        const userId = url.searchParams.get('user_id');
-        if (!userId) return Response.json({ error: 'Missing user_id' }, { status: 400 });
-        return this.handleGetServers(parseInt(userId));
+        const userIdStr = url.searchParams.get('user_id');
+        if (!userIdStr) return Response.json({ error: 'Missing user_id' }, { status: 400 });
+        const userId = parseInt(userIdStr);
+        if (isNaN(userId)) return Response.json({ error: 'Invalid user_id' }, { status: 400 });
+        return this.handleGetServers(userId);
       }
       if (path === '/internal/servers' && request.method === 'POST') {
         return this.handleAddServer(request);
@@ -152,9 +168,11 @@ export class UserDBDO {
 
       // --- 用户自定义主题 ---
       if (path === '/internal/theme' && request.method === 'GET') {
-        const userId = url.searchParams.get('user_id');
-        if (!userId) return Response.json({ error: 'Missing user_id' }, { status: 400 });
-        return this.handleGetTheme(parseInt(userId));
+        const userIdStr = url.searchParams.get('user_id');
+        if (!userIdStr) return Response.json({ error: 'Missing user_id' }, { status: 400 });
+        const userId = parseInt(userIdStr);
+        if (isNaN(userId)) return Response.json({ error: 'Invalid user_id' }, { status: 400 });
+        return this.handleGetTheme(userId);
       }
       if (path === '/internal/theme' && request.method === 'PUT') {
         return this.handlePutTheme(request);
@@ -167,9 +185,11 @@ export class UserDBDO {
 
       // --- known_hosts 管理 ---
       if (path === '/internal/known-hosts' && request.method === 'GET') {
-        const userId = url.searchParams.get('user_id');
-        if (!userId) return Response.json({ error: 'Missing user_id' }, { status: 400 });
-        return this.handleGetKnownHosts(parseInt(userId), url.searchParams.get('host'), url.searchParams.get('port'));
+        const userIdStr = url.searchParams.get('user_id');
+        if (!userIdStr) return Response.json({ error: 'Missing user_id' }, { status: 400 });
+        const userId = parseInt(userIdStr);
+        if (isNaN(userId)) return Response.json({ error: 'Invalid user_id' }, { status: 400 });
+        return this.handleGetKnownHosts(userId, url.searchParams.get('host'), url.searchParams.get('port'));
       }
       if (path === '/internal/known-hosts' && request.method === 'POST') {
         return this.handleUpsertKnownHost(request);
@@ -180,17 +200,21 @@ export class UserDBDO {
 
       // --- AI 配置管理 ---
       if (path === '/internal/ai-config' && request.method === 'GET') {
-        const userId = url.searchParams.get('user_id');
-        if (!userId) return Response.json({ error: 'Missing user_id' }, { status: 400 });
-        return this.handleGetAIConfig(parseInt(userId));
+        const userIdStr = url.searchParams.get('user_id');
+        if (!userIdStr) return Response.json({ error: 'Missing user_id' }, { status: 400 });
+        const userId = parseInt(userIdStr);
+        if (isNaN(userId)) return Response.json({ error: 'Invalid user_id' }, { status: 400 });
+        return this.handleGetAIConfig(userId);
       }
       if (path === '/internal/ai-config' && request.method === 'PUT') {
         return this.handlePutAIConfig(request);
       }
       if (path === '/internal/ai-config/decrypt' && request.method === 'GET') {
-        const userId = url.searchParams.get('user_id');
-        if (!userId) return Response.json({ error: 'Missing user_id' }, { status: 400 });
-        return this.handleGetAIConfigDecrypted(parseInt(userId));
+        const userIdStr = url.searchParams.get('user_id');
+        if (!userIdStr) return Response.json({ error: 'Missing user_id' }, { status: 400 });
+        const userId = parseInt(userIdStr);
+        if (isNaN(userId)) return Response.json({ error: 'Invalid user_id' }, { status: 400 });
+        return this.handleGetAIConfigDecrypted(userId);
       }
 
       return Response.json({ error: 'Not Found' }, { status: 404 });
@@ -296,7 +320,7 @@ export class UserDBDO {
   private handleGetServers(userId: number): Response {
     const rows = this.db
       .exec(
-        `SELECT id, user_id, name, host, port, username, auth_method, created_at, updated_at
+        `SELECT id, user_id, name, host, port, username, auth_method, region, inferred_hint, created_at, updated_at
          FROM servers WHERE user_id = ? ORDER BY updated_at DESC`,
         userId
       )
@@ -314,32 +338,53 @@ export class UserDBDO {
       username: string;
       credential: string;
       auth_method: string;
+      region?: string;
     }>();
 
     // 加密凭据
     const encrypted = await this.encryptCredential(body.credential, body.user_id);
 
+    // 保存时一次性推断 locationHint，结果持久化入 inferred_hint 列
+    // 失败时返回 null，连接时退化为 Auto
+    let inferredHint: string | null = null;
+    let inferDebug: string[] = [];
+    try {
+      const result = await inferLocationHint(body.host);
+      inferredHint = result.hint ?? null;
+      inferDebug = result.debug;
+    } catch (e) {
+      inferDebug.push(`[IP-GEO] 异常: ${e instanceof Error ? e.message : String(e)}`);
+      inferredHint = null;
+    }
+
     this.db.exec(
-      'INSERT INTO servers (user_id, name, host, port, username, credential, auth_method) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO servers (user_id, name, host, port, username, credential, auth_method, region, inferred_hint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
       body.user_id,
       body.name,
       body.host,
       body.port || 22,
       body.username,
       encrypted,
-      body.auth_method || 'password'
+      body.auth_method || 'password',
+      (ALLOWED_LOCATION_HINTS as readonly string[]).includes(body.region || '') ? (body.region || null) : null,  // 白名单校验，非法值退化为 Auto
+      inferredHint            // 系统推断值（可 NULL）
     );
 
     // 获取新创建的记录
     const rows = this.db
       .exec(
-        `SELECT id, user_id, name, host, port, username, auth_method, created_at, updated_at
+        `SELECT id, user_id, name, host, port, username, auth_method, region, inferred_hint, created_at, updated_at
          FROM servers WHERE user_id = ? ORDER BY id DESC LIMIT 1`,
         body.user_id
       )
       .toArray();
 
-    return Response.json(rows[0] as unknown as ServerConfig, { status: 201 });
+    // DEBUG_MODE 开启时，在响应中附带调试信息
+    const server = rows[0] as unknown as ServerConfig;
+    if (this.env.DEBUG_MODE === 'true') {
+      return Response.json({ ...server, _debug: inferDebug }, { status: 201 });
+    }
+    return Response.json(server, { status: 201 });
   }
 
   private async handleUpdateServer(serverId: number, request: Request): Promise<Response> {
@@ -351,6 +396,7 @@ export class UserDBDO {
       username?: string;
       credential?: string;
       auth_method?: string;
+      region?: string;
     }>();
 
     // 验证服务器属于该用户
@@ -361,7 +407,7 @@ export class UserDBDO {
 
     // 构建更新语句
     const updates: string[] = [];
-    const values: (string | number)[] = [];
+    const values: (string | number | null)[] = [];
 
     if (body.name !== undefined) {
       updates.push('name = ?');
@@ -370,6 +416,16 @@ export class UserDBDO {
     if (body.host !== undefined) {
       updates.push('host = ?');
       values.push(body.host);
+      // host 变更 → 重新推断 locationHint 并覆盖 inferred_hint 列
+      let newInferred: string | null = null;
+      try {
+        const result = await inferLocationHint(body.host);
+        newInferred = result.hint ?? null;
+      } catch {
+        newInferred = null;
+      }
+      updates.push('inferred_hint = ?');
+      values.push(newInferred);
     }
     if (body.port !== undefined) {
       updates.push('port = ?');
@@ -388,6 +444,11 @@ export class UserDBDO {
       updates.push('auth_method = ?');
       values.push(body.auth_method);
     }
+    if (body.region !== undefined) {
+      // 空字符串视为 Auto（清空手动覆盖）；白名单校验非法值
+      updates.push('region = ?');
+      values.push((ALLOWED_LOCATION_HINTS as readonly string[]).includes(body.region) ? body.region : null);
+    }
 
     if (updates.length > 0) {
       updates.push("updated_at = datetime('now')");
@@ -397,7 +458,7 @@ export class UserDBDO {
 
     const row = this.db
       .exec(
-        `SELECT id, user_id, name, host, port, username, auth_method, created_at, updated_at
+        `SELECT id, user_id, name, host, port, username, auth_method, region, inferred_hint, created_at, updated_at
          FROM servers WHERE id = ?`,
         serverId
       )
@@ -462,6 +523,7 @@ export class UserDBDO {
     const server = rows[0] as unknown as {
       id: number; user_id: number; name: string; host: string;
       port: number; username: string; credential: string; auth_method: string;
+      region: string | null; inferred_hint: string | null;
     };
 
     // 解密凭据
@@ -477,6 +539,10 @@ export class UserDBDO {
       expectedFingerprint = (khRows[0] as unknown as { fingerprint: string }).fingerprint;
     }
 
+    // 计算 DO locationHint：
+    // 优先级：用户手动覆盖 (region) > 系统推断持久化值 (inferred_hint) > 无 hint（Auto）
+    const locationHint = server.region || server.inferred_hint || undefined;
+
     // 生成 one-time-token
     const token = crypto.randomUUID();
     const config: SSHConnectionConfig = {
@@ -488,6 +554,7 @@ export class UserDBDO {
       privateKey: server.auth_method === 'publickey' ? credential : '',
       expectedFingerprint,
       userId: String(body.user_id),
+      locationHint,
     };
 
     // 防止 token 数量无限增长
@@ -569,6 +636,9 @@ export class UserDBDO {
   private encryptionSecret: string | null = null;
 
   private async deriveEncryptionKey(userId: number): Promise<CryptoKey> {
+    const cached = this.derivedKeyCache.get(userId);
+    if (cached) return cached;
+
     if (!this.encryptionSecret) {
       const rows = this.db.exec("SELECT value FROM system_config WHERE key = 'encryption_secret'").toArray();
       if (rows.length > 0) {
@@ -597,13 +667,16 @@ export class UserDBDO {
       ['deriveKey']
     );
 
-    return crypto.subtle.deriveKey(
+    const derived = await crypto.subtle.deriveKey(
       { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
       keyMaterial,
       { name: 'AES-GCM', length: 256 },
       false,
       ['encrypt', 'decrypt']
     );
+
+    this.derivedKeyCache.set(userId, derived);
+    return derived;
   }
 
   // ==================== 速率限制 ====================
