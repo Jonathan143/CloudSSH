@@ -1,8 +1,11 @@
 import { Env, UserInfo, ServerConfig, SSHConnectionConfig, ALLOWED_LOCATION_HINTS } from '../types';
 import { inferLocationHint, type InferResult } from './ip-geo';
+import { deserializeServerRow, serializeServerTags } from './server-tags';
+
+const AUTH_METHODS = new Set(['password', 'publickey']);
 
 /**
- * UserDBDO — 用户数据库 Durable Object（全局单例）
+ * UserDBDO — 按 GitHub 用户 ID 命名并隔离的用户数据库 Durable Object
  *
  * 职责：
  * - 用户管理（GitHub OAuth 登录后创建/更新）
@@ -60,6 +63,7 @@ export class UserDBDO {
         auth_method TEXT DEFAULT 'password',
         region      TEXT DEFAULT NULL,
         inferred_hint TEXT DEFAULT NULL,
+        tags        TEXT NOT NULL DEFAULT '[]',
         created_at  TEXT DEFAULT (datetime('now')),
         updated_at  TEXT DEFAULT (datetime('now'))
       );
@@ -104,6 +108,9 @@ export class UserDBDO {
     }
     if (!serverCols.some((c: any) => c.name === 'inferred_hint')) {
       this.db.exec("ALTER TABLE servers ADD COLUMN inferred_hint TEXT DEFAULT NULL");
+    }
+    if (!serverCols.some((c: any) => c.name === 'tags')) {
+      this.db.exec("ALTER TABLE servers ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'");
     }
   }
 
@@ -154,11 +161,6 @@ export class UserDBDO {
         return this.handleConnectServer(parseInt(connectMatch[1]), request);
       }
 
-      // --- One-time-token 消费 ---
-      if (path === '/internal/connect-token/consume' && request.method === 'POST') {
-        return this.handleConsumeToken(request);
-      }
-
       // --- 用户自定义主题 ---
       if (path === '/internal/theme' && request.method === 'GET') {
         const userIdStr = url.searchParams.get('user_id');
@@ -169,6 +171,10 @@ export class UserDBDO {
       }
       if (path === '/internal/theme' && request.method === 'PUT') {
         return this.handlePutTheme(request);
+      }
+      // --- One-time-token 消费 ---
+      if (path === '/internal/connect-token/consume' && request.method === 'POST') {
+        return this.handleConsumeToken(request);
       }
 
       // --- known_hosts 管理 ---
@@ -317,13 +323,13 @@ export class UserDBDO {
   private handleGetServers(userId: number): Response {
     const rows = this.db
       .exec(
-        `SELECT id, user_id, name, host, port, username, auth_method, region, inferred_hint, created_at, updated_at
+        `SELECT id, user_id, name, host, port, username, auth_method, region, inferred_hint, tags, created_at, updated_at
          FROM servers WHERE user_id = ? ORDER BY updated_at DESC`,
         userId
       )
       .toArray();
 
-    return Response.json(rows as unknown as ServerConfig[]);
+    return Response.json(rows.map((row: Record<string, unknown>) => deserializeServerRow(row)) as unknown as ServerConfig[]);
   }
 
   private async handleAddServer(request: Request): Promise<Response> {
@@ -336,54 +342,69 @@ export class UserDBDO {
       credential: string;
       auth_method: string;
       region?: string;
+      tags?: unknown;
     }>();
+
+    const port = body.port ?? 22;
+    if (!Number.isInteger(port) || port < 1 || port > 65535) {
+      return Response.json({ error: '端口必须是 1-65535 之间的整数' }, { status: 400 });
+    }
+    if (!AUTH_METHODS.has(body.auth_method)) {
+      return Response.json({ error: '不支持的认证方式' }, { status: 400 });
+    }
+    if (typeof body.credential !== 'string' || body.credential.length === 0) {
+      return Response.json({ error: '认证凭据不能为空' }, { status: 400 });
+    }
+
+    const region = (ALLOWED_LOCATION_HINTS as readonly string[]).includes(body.region || '')
+      ? body.region || null
+      : null;
 
     // 加密凭据
     const encrypted = await this.encryptCredential(body.credential, body.user_id);
 
-    // 保存时一次性推断 locationHint，结果持久化入 inferred_hint 列
+    // Auto 模式保存时一次性推断 locationHint，结果持久化入 inferred_hint 列
+    // 手动区域已经能够直接决定调度，无需向 IPinfo 发送主机信息
     // 失败时返回 null，连接时退化为 Auto
     let inferredHint: string | null = null;
     let inferDebug: string[] = [];
-    try {
-      const result = await inferLocationHint(body.host);
-      inferredHint = result.hint ?? null;
-      inferDebug = result.debug;
-    } catch (e) {
-      inferDebug.push(`[IP-GEO] 异常: ${e instanceof Error ? e.message : String(e)}`);
-      inferredHint = null;
-    }
-
-    // 校验端口范围
-    const port = body.port || 22;
-    if (!Number.isInteger(port) || port < 1 || port > 65535) {
-      return Response.json({ error: '端口必须是 1-65535 之间的整数' }, { status: 400 });
+    if (region === null) {
+      try {
+        const result = await inferLocationHint(body.host);
+        inferredHint = result.hint ?? null;
+        inferDebug = result.debug;
+      } catch (e) {
+        inferDebug.push(`[IP-GEO] 异常: ${e instanceof Error ? e.message : String(e)}`);
+      }
+    } else {
+      inferDebug.push('[IP-GEO] 已手动指定区域，跳过推断');
     }
 
     this.db.exec(
-      'INSERT INTO servers (user_id, name, host, port, username, credential, auth_method, region, inferred_hint) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      'INSERT INTO servers (user_id, name, host, port, username, credential, auth_method, region, inferred_hint, tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       body.user_id,
       body.name,
       body.host,
       port,
       body.username,
       encrypted,
-      body.auth_method || 'password',
-      (ALLOWED_LOCATION_HINTS as readonly string[]).includes(body.region || '') ? (body.region || null) : null,  // 白名单校验，非法值退化为 Auto
-      inferredHint            // 系统推断值（可 NULL）
+      body.auth_method,
+      region,
+      inferredHint,           // 系统推断值（可 NULL）
+      serializeServerTags(body.tags)
     );
 
     // 获取新创建的记录
     const rows = this.db
       .exec(
-        `SELECT id, user_id, name, host, port, username, auth_method, region, inferred_hint, created_at, updated_at
+        `SELECT id, user_id, name, host, port, username, auth_method, region, inferred_hint, tags, created_at, updated_at
          FROM servers WHERE user_id = ? ORDER BY id DESC LIMIT 1`,
         body.user_id
       )
       .toArray();
 
     // DEBUG_MODE 开启时，在响应中附带调试信息
-    const server = rows[0] as unknown as ServerConfig;
+    const server = deserializeServerRow(rows[0] as Record<string, unknown>) as unknown as ServerConfig;
     if (this.env.DEBUG_MODE === 'true') {
       return Response.json({ ...server, _debug: inferDebug }, { status: 201 });
     }
@@ -400,13 +421,45 @@ export class UserDBDO {
       credential?: string;
       auth_method?: string;
       region?: string;
+      tags?: unknown;
     }>();
 
     // 验证服务器属于该用户
-    const existing = this.db.exec('SELECT user_id FROM servers WHERE id = ?', serverId).toArray();
+    const existing = this.db.exec(
+      'SELECT user_id, host, auth_method, region, inferred_hint FROM servers WHERE id = ?',
+      serverId,
+    ).toArray();
     if (existing.length === 0) return Response.json({ error: 'Server not found' }, { status: 404 });
-    if ((existing[0] as unknown as { user_id: number }).user_id !== body.user_id)
+    const current = existing[0] as unknown as {
+      user_id: number;
+      host: string;
+      auth_method: string;
+      region: string | null;
+      inferred_hint: string | null;
+    };
+    if (current.user_id !== body.user_id)
       return Response.json({ error: 'Forbidden' }, { status: 403 });
+
+    if (body.auth_method !== undefined && !AUTH_METHODS.has(body.auth_method)) {
+      return Response.json({ error: '不支持的认证方式' }, { status: 400 });
+    }
+    const hasNewCredential = typeof body.credential === 'string' && body.credential.length > 0;
+    if (body.credential !== undefined && !hasNewCredential) {
+      return Response.json({ error: '认证凭据不能为空' }, { status: 400 });
+    }
+    if (body.auth_method !== undefined
+      && body.auth_method !== current.auth_method
+      && !hasNewCredential) {
+      return Response.json({ error: '切换认证方式时必须同时提供对应凭据' }, { status: 400 });
+    }
+
+    const normalizedRegion = body.region !== undefined
+      ? ((ALLOWED_LOCATION_HINTS as readonly string[]).includes(body.region) ? body.region : null)
+      : current.region;
+    const hostChanged = body.host !== undefined && body.host !== current.host;
+    const switchedToAuto = body.region !== undefined
+      && normalizedRegion === null
+      && current.region !== null;
 
     // 构建更新语句
     const updates: string[] = [];
@@ -419,10 +472,25 @@ export class UserDBDO {
     if (body.host !== undefined) {
       updates.push('host = ?');
       values.push(body.host);
-      // host 变更 → 重新推断 locationHint 并覆盖 inferred_hint 列
+    }
+    if (hostChanged) {
+      // 手动区域无需推断；Auto 模式仅在主机实际变化时重新查询
+      let newInferred: string | null = null;
+      if (normalizedRegion === null) {
+        try {
+          const result = await inferLocationHint(body.host!);
+          newInferred = result.hint ?? null;
+        } catch {
+          newInferred = null;
+        }
+      }
+      updates.push('inferred_hint = ?');
+      values.push(newInferred);
+    } else if (switchedToAuto && current.inferred_hint === null) {
+      // 手动模式新增的记录没有推断值，首次切回 Auto 时补做一次查询
       let newInferred: string | null = null;
       try {
-        const result = await inferLocationHint(body.host);
+        const result = await inferLocationHint(current.host);
         newInferred = result.hint ?? null;
       } catch {
         newInferred = null;
@@ -441,8 +509,8 @@ export class UserDBDO {
       updates.push('username = ?');
       values.push(body.username);
     }
-    if (body.credential !== undefined) {
-      const encrypted = await this.encryptCredential(body.credential, body.user_id);
+    if (hasNewCredential) {
+      const encrypted = await this.encryptCredential(body.credential!, body.user_id);
       updates.push('credential = ?');
       values.push(encrypted);
     }
@@ -453,7 +521,11 @@ export class UserDBDO {
     if (body.region !== undefined) {
       // 空字符串视为 Auto（清空手动覆盖）；白名单校验非法值
       updates.push('region = ?');
-      values.push((ALLOWED_LOCATION_HINTS as readonly string[]).includes(body.region) ? body.region : null);
+      values.push(normalizedRegion);
+    }
+    if (body.tags !== undefined) {
+      updates.push('tags = ?');
+      values.push(serializeServerTags(body.tags));
     }
 
     if (updates.length > 0) {
@@ -464,13 +536,13 @@ export class UserDBDO {
 
     const row = this.db
       .exec(
-        `SELECT id, user_id, name, host, port, username, auth_method, region, inferred_hint, created_at, updated_at
+        `SELECT id, user_id, name, host, port, username, auth_method, region, inferred_hint, tags, created_at, updated_at
          FROM servers WHERE id = ?`,
         serverId
       )
       .toArray();
 
-    return Response.json(row[0] as unknown as ServerConfig);
+    return Response.json(deserializeServerRow(row[0] as Record<string, unknown>) as unknown as ServerConfig);
   }
 
   private async handleDeleteServer(serverId: number, request: Request): Promise<Response> {

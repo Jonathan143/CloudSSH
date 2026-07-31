@@ -1,5 +1,7 @@
 import { populateRegionSelect, regionLabel } from './regions';
 import { confirmAction, notify } from './ui-feedback';
+import { onLocaleChange, t } from './i18n';
+import { parsePort } from './port';
 
 interface UserInfo {
   id: number;
@@ -8,7 +10,7 @@ interface UserInfo {
   avatar_url: string;
 }
 
-interface ServerConfig {
+export interface ServerConfig {
   id: number;
   user_id: number;
   name: string;
@@ -18,8 +20,57 @@ interface ServerConfig {
   auth_method: 'password' | 'publickey';
   region?: string | null;
   inferred_hint?: string | null;
+  tags: string[];
   created_at: string;
   updated_at: string;
+}
+
+export const SERVER_PAGE_SIZE = 9;
+
+export function normalizeTagsInput(value: string): string[] {
+  const tags: string[] = [];
+  const seen = new Set<string>();
+  for (const part of value.split(/[,，]/)) {
+    const tag = part.trim().replace(/\s+/g, ' ').slice(0, 24);
+    const key = tag.toLocaleLowerCase();
+    if (!tag || seen.has(key)) continue;
+    seen.add(key);
+    tags.push(tag);
+    if (tags.length >= 10) break;
+  }
+  return tags;
+}
+
+export function filterServers(
+  servers: readonly ServerConfig[],
+  query: string,
+  selectedTag = '',
+): ServerConfig[] {
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+
+  return servers.filter((server) => {
+    const matchesQuery = !normalizedQuery || [server.name, server.host, server.username]
+      .some((value) => value.toLocaleLowerCase().includes(normalizedQuery));
+    const matchesTag = !selectedTag || (server.tags || []).some(
+      (tag) => tag.toLocaleLowerCase() === selectedTag.toLocaleLowerCase(),
+    );
+    return matchesQuery && matchesTag;
+  });
+}
+
+export function paginateServers(
+  servers: readonly ServerConfig[],
+  page: number,
+  pageSize = SERVER_PAGE_SIZE,
+): { items: ServerConfig[]; currentPage: number; totalPages: number } {
+  const totalPages = Math.max(1, Math.ceil(servers.length / pageSize));
+  const currentPage = Math.min(Math.max(1, Math.floor(page)), totalPages);
+  const start = (currentPage - 1) * pageSize;
+  return {
+    items: servers.slice(start, start + pageSize),
+    currentPage,
+    totalPages,
+  };
 }
 
 /**
@@ -29,18 +80,23 @@ export class ServerList {
   private user: UserInfo;
   private servers: ServerConfig[] = [];
   private onLogout: () => void;
-  private onConnect: (wsUrl: string, serverName: string, hostInfo?: { host: string; port: number }) => void;
+  private onConnect: (wsUrl: string, serverName: string, hostInfo?: { host: string; port: number; username?: string }) => void;
   private editingServerId: number | null = null;
+  private editingOriginalAuthMethod: ServerConfig['auth_method'] | null = null;
   private modalAuthMode: 'password' | 'key' = 'password';
+  private searchQuery = '';
+  private selectedTag = '';
+  private currentPage = 1;
 
   constructor(
     user: UserInfo,
     onLogout: () => void,
-    onConnect: (wsUrl: string, serverName: string, hostInfo?: { host: string; port: number }) => void
+    onConnect: (wsUrl: string, serverName: string, hostInfo?: { host: string; port: number; username?: string }) => void
   ) {
     this.user = user;
     this.onLogout = onLogout;
     this.onConnect = onConnect;
+    onLocaleChange(() => this.renderServerGrid());
     this.init();
   }
 
@@ -78,33 +134,61 @@ export class ServerList {
     // 退出登录
     document.getElementById('logout-btn')?.addEventListener('click', () => this.logout());
 
-    // AI 配置
-    document.getElementById('ai-config-btn')?.addEventListener('click', () => {
-      import('./main').then(m => m.showAIConfig());
-    });
-
     // 添加服务器按钮
     document.getElementById('add-server-btn')?.addEventListener('click', () => this.showModal('add'));
     document.getElementById('empty-add-btn')?.addEventListener('click', () => this.showModal('add'));
 
+    const searchInput = document.getElementById('server-search') as HTMLInputElement | null;
+    const clearSearchButton = document.getElementById('server-search-clear');
+    searchInput?.addEventListener('input', () => {
+      this.searchQuery = searchInput.value;
+      this.currentPage = 1;
+      this.renderServerGrid();
+    });
+    clearSearchButton?.addEventListener('click', () => {
+      this.searchQuery = '';
+      this.currentPage = 1;
+      if (searchInput) {
+        searchInput.value = '';
+        searchInput.focus();
+      }
+      this.renderServerGrid();
+    });
+
+    (document.getElementById('server-tag-filter') as HTMLSelectElement | null)?.addEventListener('change', (event) => {
+      this.selectedTag = (event.target as HTMLSelectElement).value;
+      this.currentPage = 1;
+      this.renderServerGrid();
+    });
+    document.getElementById('server-page-prev')?.addEventListener('click', () => {
+      this.currentPage--;
+      this.renderServerGrid();
+    });
+    document.getElementById('server-page-next')?.addEventListener('click', () => {
+      this.currentPage++;
+      this.renderServerGrid();
+    });
+
     // Modal 关闭
     document.getElementById('modal-close-btn')?.addEventListener('click', () => this.hideModal());
     document.getElementById('modal-backdrop')?.addEventListener('click', () => this.hideModal());
+    document.getElementById('server-modal')?.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        this.hideModal();
+      }
+    });
 
     // Modal 提交
-    document.getElementById('server-submit-btn')?.addEventListener('click', () => this.handleSubmit());
+    document.getElementById('server-form')?.addEventListener('submit', (event) => {
+      event.preventDefault();
+      void this.handleSubmit();
+    });
 
     // Modal 认证方式切换
     document.getElementById('modal-auth-tab-password')?.addEventListener('click', () => this.setModalAuthMode('password'));
     document.getElementById('modal-auth-tab-key')?.addEventListener('click', () => this.setModalAuthMode('key'));
 
-    // 回车提交
-    document.getElementById('server-form')?.addEventListener('keypress', (e) => {
-      if (e.key === 'Enter') {
-        e.preventDefault();
-        this.handleSubmit();
-      }
-    });
   }
 
   // ==================== 数据获取 ====================
@@ -113,7 +197,11 @@ export class ServerList {
     try {
       const res = await fetch('/api/servers');
       if (!res.ok) throw new Error('Failed to fetch servers');
-      this.servers = await res.json();
+      const servers = await res.json() as ServerConfig[];
+      this.servers = servers.map((server) => ({
+        ...server,
+        tags: Array.isArray(server.tags) ? server.tags : [],
+      }));
       this.renderServerGrid();
     } catch (e) {
       console.error('Failed to fetch servers:', e);
@@ -127,28 +215,90 @@ export class ServerList {
   private renderServerGrid(): void {
     const grid = document.getElementById('server-grid');
     const emptyState = document.getElementById('empty-state');
-    if (!grid || !emptyState) return;
+    const searchWrapper = document.getElementById('server-search-wrapper');
+    const searchEmptyState = document.getElementById('server-search-empty');
+    const clearSearchButton = document.getElementById('server-search-clear');
+    const tagFilterWrapper = document.getElementById('server-tag-filter-wrapper');
+    const tagFilter = document.getElementById('server-tag-filter') as HTMLSelectElement | null;
+    const pagination = document.getElementById('server-pagination');
+    if (!grid || !emptyState || !searchWrapper || !searchEmptyState) return;
 
     if (this.servers.length === 0) {
       grid.innerHTML = '';
+      searchWrapper.classList.add('hidden');
+      pagination?.classList.add('hidden');
+      pagination?.classList.remove('flex');
+      searchEmptyState.classList.add('hidden');
+      searchEmptyState.classList.remove('flex');
       emptyState.classList.remove('hidden');
       emptyState.classList.add('flex');
       return;
     }
 
+    searchWrapper.classList.remove('hidden');
     emptyState.classList.add('hidden');
     emptyState.classList.remove('flex');
+    clearSearchButton?.classList.toggle('hidden', this.searchQuery.length === 0);
 
-    grid.innerHTML = this.servers
+    const allTags = [...new Set(this.servers.flatMap((server) => server.tags || []))]
+      .sort((a, b) => a.localeCompare(b));
+    tagFilterWrapper?.classList.toggle('hidden', allTags.length === 0);
+    if (tagFilter) {
+      if (this.selectedTag && !allTags.includes(this.selectedTag)) this.selectedTag = '';
+      tagFilter.innerHTML = [
+        `<option value="">${t('server.allTags')}</option>`,
+        ...allTags.map((tag) => `<option value="${this.escapeHtml(tag)}">${this.escapeHtml(tag)}</option>`),
+      ].join('');
+      tagFilter.value = this.selectedTag;
+    }
+
+    const filteredServers = filterServers(this.servers, this.searchQuery, this.selectedTag);
+    if (filteredServers.length === 0) {
+      grid.innerHTML = '';
+      pagination?.classList.add('hidden');
+      pagination?.classList.remove('flex');
+      searchEmptyState.classList.remove('hidden');
+      searchEmptyState.classList.add('flex');
+      return;
+    }
+
+    searchEmptyState.classList.add('hidden');
+    searchEmptyState.classList.remove('flex');
+
+    const page = paginateServers(filteredServers, this.currentPage);
+    this.currentPage = page.currentPage;
+    const visibleServers = page.items;
+
+    grid.innerHTML = visibleServers
       .map((server) => this.renderServerCard(server))
       .join('');
 
     // 绑定卡片事件
-    this.servers.forEach((server) => {
+    visibleServers.forEach((server) => {
       document.getElementById(`connect-${server.id}`)?.addEventListener('click', () => this.connectServer(server.id));
       document.getElementById(`edit-${server.id}`)?.addEventListener('click', () => this.showModal('edit', server));
       document.getElementById(`delete-${server.id}`)?.addEventListener('click', () => this.deleteServer(server.id));
     });
+
+    if (page.totalPages > 1) {
+      pagination?.classList.remove('hidden');
+      pagination?.classList.add('flex');
+      const previous = document.getElementById('server-page-prev') as HTMLButtonElement | null;
+      const next = document.getElementById('server-page-next') as HTMLButtonElement | null;
+      if (previous) previous.disabled = page.currentPage === 1;
+      if (next) next.disabled = page.currentPage === page.totalPages;
+      const info = document.getElementById('server-page-info');
+      if (info) {
+        info.textContent = t('server.pageInfo', {
+          current: page.currentPage,
+          total: page.totalPages,
+          count: filteredServers.length,
+        });
+      }
+    } else {
+      pagination?.classList.add('hidden');
+      pagination?.classList.remove('flex');
+    }
   }
 
   private renderServerCard(server: ServerConfig): string {
@@ -160,8 +310,13 @@ export class ServerList {
     const isManual = !!server.region;
     const regionLabelText = regionLabel(effectiveHint);
     const regionTag = effectiveHint
-      ? (isManual ? '手动' : '自动')
-      : '自动';
+      ? (isManual ? t('server.regionManual') : t('server.regionAuto'))
+      : t('server.regionAuto');
+    const tagMarkup = (server.tags || []).length > 0
+      ? `<div class="flex flex-wrap gap-1 mt-3">${server.tags.map((tag) =>
+          `<span class="text-[9px] text-primary border border-[var(--border-strong)] px-1.5 py-0.5">#${this.escapeHtml(tag)}</span>`
+        ).join('')}</div>`
+      : '';
 
     return `
       <div class="server-card p-5 relative group" id="card-${server.id}">
@@ -180,32 +335,33 @@ export class ServerList {
 
         <div class="space-y-1.5 text-xs text-muted mb-4">
           <div class="flex items-center gap-2">
-            <span class="text-dim">HOST</span>
+            <span class="text-dim">${t('server.hostLabel')}</span>
             <span class="text-on-surface">${this.escapeHtml(server.host)}:${server.port}</span>
           </div>
           <div class="flex items-center gap-2">
-            <span class="text-dim">USER</span>
+            <span class="text-dim">${t('server.userLabel')}</span>
             <span class="text-on-surface">${this.escapeHtml(server.username)}</span>
           </div>
           <div class="flex items-center gap-2">
-            <span class="text-dim">REGION</span>
+            <span class="text-dim">${t('server.regionLabel')}</span>
             <span class="text-on-surface flex items-center gap-1">
               <span class="material-symbols-outlined" style="font-size: 11px; color: var(--accent-secondary);">${effectiveHint ? 'my_location' : 'explore'}</span>
               ${this.escapeHtml(regionLabelText)}
             </span>
             <span class="text-[9px] text-dim border border-dim px-1 py-0.5 ml-0.5">${regionTag}</span>
           </div>
+          ${tagMarkup}
         </div>
 
-        <div class="flex gap-2 pt-3 border-t border-[var(--border)]">
-          <button id="connect-${server.id}" class="cyber-button text-primary flex-1 py-1.5 px-3 text-[10px] font-bold tracking-[0.1em] uppercase flex items-center justify-center gap-1" title="Connect">
+        <div class="server-card-actions flex gap-2 pt-3 border-t border-[var(--border)]">
+          <button id="connect-${server.id}" class="cyber-button text-primary flex-1 py-1.5 px-3 text-[10px] font-bold tracking-[0.1em] uppercase flex items-center justify-center gap-1" title="${t('common.connect')}">
             <span class="material-symbols-outlined" style="font-size: 14px;">power_settings_new</span>
-            CONNECT
+            ${t('common.connect')}
           </button>
-          <button id="edit-${server.id}" class="cyber-button text-primary py-1.5 px-3 text-[10px] font-bold tracking-[0.1em] flex items-center justify-center" title="Edit">
+          <button id="edit-${server.id}" class="cyber-button text-primary py-1.5 px-3 text-[10px] font-bold tracking-[0.1em] flex items-center justify-center" title="${t('common.edit')}">
             <span class="material-symbols-outlined" style="font-size: 14px;">edit</span>
           </button>
-          <button id="delete-${server.id}" class="cyber-button py-1.5 px-3 text-[10px] font-bold tracking-[0.1em] flex items-center justify-center text-error border-[var(--error)] hover:bg-[var(--error)] hover:text-[var(--bg)]" title="Delete">
+          <button id="delete-${server.id}" class="cyber-button py-1.5 px-3 text-[10px] font-bold tracking-[0.1em] flex items-center justify-center text-error border-[var(--error)] hover:bg-[var(--error)] hover:text-[var(--bg)]" title="${t('common.delete')}">
             <span class="material-symbols-outlined" style="font-size: 14px;">delete</span>
           </button>
         </div>
@@ -223,7 +379,7 @@ export class ServerList {
     if (connectBtn) {
       connectBtn.innerHTML = `
         <span class="material-symbols-outlined animate-spin" style="font-size: 14px;">progress_activity</span>
-        CONNECTING...
+        ${t('server.connecting')}
       `;
       (connectBtn as HTMLButtonElement).disabled = true;
     }
@@ -245,17 +401,21 @@ export class ServerList {
       const { wsUrl } = await res.json() as { wsUrl: string };
 
       // 在当前页面内创建新标签并连接
-      this.onConnect(wsUrl, server.name, { host: server.host, port: server.port });
+      this.onConnect(wsUrl, server.name, {
+        host: server.host,
+        port: server.port,
+        username: server.username,
+      });
     } catch (e) {
       notify(e instanceof Error ? e.message : String(e), {
-        title: '连接失败',
+        title: t('server.connectFailed'),
         variant: 'danger',
       });
     } finally {
       if (connectBtn) {
         connectBtn.innerHTML = `
           <span class="material-symbols-outlined" style="font-size: 14px;">power_settings_new</span>
-          CONNECT
+          ${t('common.connect')}
         `;
         (connectBtn as HTMLButtonElement).disabled = false;
       }
@@ -267,10 +427,10 @@ export class ServerList {
     if (!server) return;
 
     const confirmed = await confirmAction({
-      title: '删除服务器',
-      message: `确定要删除服务器“${server.name}”吗？保存的连接信息和凭据也会一并删除。`,
-      confirmText: '删除',
-      cancelText: '保留',
+      title: t('server.deleteTitle'),
+      message: t('server.deleteMessage', { name: server.name }),
+      confirmText: t('common.delete'),
+      cancelText: t('server.keep'),
       variant: 'danger',
     });
     if (!confirmed) return;
@@ -291,7 +451,7 @@ export class ServerList {
       this.renderServerGrid();
     } catch (e) {
       notify(e instanceof Error ? e.message : String(e), {
-        title: '删除失败',
+        title: t('feedback.danger'),
         variant: 'danger',
       });
       await this.fetchServers();
@@ -302,16 +462,17 @@ export class ServerList {
 
   showModal(mode: 'add' | 'edit', server?: ServerConfig): void {
     this.editingServerId = mode === 'edit' && server ? server.id : null;
+    this.editingOriginalAuthMethod = mode === 'edit' && server ? server.auth_method : null;
 
     const modal = document.getElementById('server-modal');
     const title = document.getElementById('modal-title');
     const submitBtn = document.getElementById('server-submit-btn');
     if (!modal || !title || !submitBtn) return;
 
-    title.textContent = mode === 'add' ? 'ADD_SERVER' : 'EDIT_SERVER';
+    title.textContent = mode === 'add' ? t('server.add') : t('server.edit');
     submitBtn.innerHTML = `
       <span class="material-symbols-outlined" style="font-size: 18px;">save</span>
-      ${mode === 'add' ? 'SAVE_SERVER' : 'UPDATE_SERVER'}
+      ${mode === 'add' ? t('server.save') : t('server.update')}
     `;
 
     // 填充表单
@@ -322,6 +483,7 @@ export class ServerList {
       (document.getElementById('server-username') as HTMLInputElement).value = server.username;
       (document.getElementById('server-password') as HTMLInputElement).value = '';
       (document.getElementById('server-private-key') as HTMLTextAreaElement).value = '';
+      (document.getElementById('server-tags') as HTMLInputElement).value = (server.tags || []).join(', ');
 
       if (server.auth_method === 'publickey') {
         this.setModalAuthMode('key');
@@ -338,7 +500,7 @@ export class ServerList {
       // 显示系统推断值（仅编辑时，让用户了解 DB 持久化的 hint）
       if (inferredInfo) {
         if (server.inferred_hint) {
-          inferredInfo.textContent = `系统推断：${regionLabel(server.inferred_hint)}`;
+          inferredInfo.textContent = t('server.regionInferred', { region: regionLabel(server.inferred_hint) });
         } else {
           inferredInfo.textContent = '';
         }
@@ -351,6 +513,7 @@ export class ServerList {
       (document.getElementById('server-username') as HTMLInputElement).value = '';
       (document.getElementById('server-password') as HTMLInputElement).value = '';
       (document.getElementById('server-private-key') as HTMLTextAreaElement).value = '';
+      (document.getElementById('server-tags') as HTMLInputElement).value = '';
       this.setModalAuthMode('password');
 
       // 新增时：region 默认 Auto，无系统推断可显示
@@ -376,6 +539,7 @@ export class ServerList {
       modal.classList.remove('flex');
     }
     this.editingServerId = null;
+    this.editingOriginalAuthMethod = null;
   }
 
   private setModalAuthMode(mode: 'password' | 'key'): void {
@@ -394,14 +558,16 @@ export class ServerList {
   private async handleSubmit(): Promise<void> {
     const name = (document.getElementById('server-name') as HTMLInputElement).value.trim();
     const host = (document.getElementById('server-host') as HTMLInputElement).value.trim();
-    const port = parseInt((document.getElementById('server-port') as HTMLInputElement).value || '22');
+    const portInput = document.getElementById('server-port') as HTMLInputElement;
+    const port = parsePort(portInput.value);
     const username = (document.getElementById('server-username') as HTMLInputElement).value.trim();
     const password = (document.getElementById('server-password') as HTMLInputElement).value;
     const privateKey = (document.getElementById('server-private-key') as HTMLTextAreaElement).value;
+    const tags = normalizeTagsInput((document.getElementById('server-tags') as HTMLInputElement).value);
 
     if (!name || !host || !username) {
-      notify('请填写服务器名称、主机和用户名', {
-        title: '服务器信息不完整',
+      notify(t('server.detailsRequired'), {
+        title: t('server.detailsTitle'),
         variant: 'warning',
       });
       const missingId = !name ? 'server-name' : !host ? 'server-host' : 'server-username';
@@ -409,13 +575,27 @@ export class ServerList {
       return;
     }
 
+    if (port === null) {
+      notify(t('auth.validationPort'), {
+        title: t('server.detailsTitle'),
+        variant: 'warning',
+      });
+      portInput.focus();
+      return;
+    }
+
     const authMethod = this.modalAuthMode === 'key' ? 'publickey' : 'password';
     const credential = authMethod === 'publickey' ? privateKey : password;
+    const authMethodChanged = this.editingServerId !== null
+      && this.editingOriginalAuthMethod !== null
+      && authMethod !== this.editingOriginalAuthMethod;
 
-    // 新增时必须填写凭据，编辑时可选
-    if (!this.editingServerId && !credential) {
-      notify(authMethod === 'publickey' ? '请粘贴私钥内容' : '请输入密码', {
-        title: '认证信息不完整',
+    // 新增或切换认证方式时必须填写与新方式匹配的凭据
+    if ((!this.editingServerId || authMethodChanged) && !credential) {
+      notify(authMethodChanged
+        ? t('server.credentialRequiredAfterAuthChange')
+        : t(authMethod === 'publickey' ? 'auth.validationPrivateKey' : 'auth.validationPassword'), {
+        title: t('auth.incompleteCredentials'),
         variant: 'warning',
       });
       const credentialId = authMethod === 'publickey' ? 'server-private-key' : 'server-password';
@@ -427,11 +607,11 @@ export class ServerList {
     submitBtn.disabled = true;
     submitBtn.innerHTML = `
       <span class="material-symbols-outlined animate-spin" style="font-size: 18px;">progress_activity</span>
-      SAVING...
+      ${t('server.saving')}
     `;
 
     try {
-      const body: any = { name, host, port, username, auth_method: authMethod };
+      const body: any = { name, host, port, username, auth_method: authMethod, tags };
       if (credential) body.credential = credential;
 
       // 区域偏好：空字符串表示 Auto（让系统自动推断）
@@ -478,11 +658,11 @@ export class ServerList {
         if (userRegion || inferred) {
           // 用户手动指定优先显示手动值，否则显示系统推断值
           const hint = userRegion || inferred;
-          notify(`已保存，区域：${regionLabel(hint)}`, { variant: 'success' });
+          notify(t('server.savedRegion', { region: regionLabel(hint) }), { variant: 'success' });
         } else {
           // 推断失败（私网 IP / 限流 / 未命中映射表）
-          notify('已保存，未能推断区域（将使用自动调度）', {
-            title: '保存成功',
+          notify(t('server.savedAuto'), {
+            title: t('feedback.success'),
             variant: 'warning',
           });
         }
@@ -492,14 +672,14 @@ export class ServerList {
       await this.fetchServers();
     } catch (e) {
       notify(e instanceof Error ? e.message : String(e), {
-        title: '保存失败',
+        title: t('feedback.danger'),
         variant: 'danger',
       });
     } finally {
       submitBtn.disabled = false;
       submitBtn.innerHTML = `
         <span class="material-symbols-outlined" style="font-size: 18px;">save</span>
-        ${this.editingServerId ? 'UPDATE_SERVER' : 'SAVE_SERVER'}
+        ${this.editingServerId ? t('server.update') : t('server.save')}
       `;
     }
   }

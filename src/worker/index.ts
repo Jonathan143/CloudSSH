@@ -1,4 +1,5 @@
 import { Env, SSHConnectionConfig, ALLOWED_LOCATION_HINTS } from '../types';
+import { THEME_MAX_BYTES, normalizeThemeData } from '../theme-schema';
 import { HTML } from './html';
 import {
   handleGitHubAuth,
@@ -103,9 +104,14 @@ async function generateVerifiedToken(secret: string): Promise<string> {
 
 async function isVerifiedTokenValid(token: string, secret: string): Promise<boolean> {
   try {
-    const [expiresStr, signature] = token.split(':');
-    const expires = parseInt(expiresStr);
-    if (isNaN(expires) || Date.now() > expires) return false;
+    const parts = token.split(':');
+    if (parts.length !== 2) return false;
+
+    const [expiresStr, signature] = parts;
+    if (!/^\d+$/.test(expiresStr) || !/^[0-9a-f]{64}$/i.test(signature)) return false;
+
+    const expires = Number(expiresStr);
+    if (!Number.isSafeInteger(expires) || Date.now() > expires) return false;
     
     // 使用 HMAC-SHA256 验证签名
     const key = await crypto.subtle.importKey(
@@ -118,7 +124,7 @@ async function isVerifiedTokenValid(token: string, secret: string): Promise<bool
     
     // 将十六进制签名转换回字节数组
     const signatureBytes = new Uint8Array(
-      signature.match(/.{1,2}/g)!.map(byte => parseInt(byte, 16))
+      signature.match(/.{2}/g)!.map(byte => parseInt(byte, 16))
     );
     
     return await crypto.subtle.verify(
@@ -176,7 +182,7 @@ export default {
       return handleServersRoute(request, url, env);
     }
 
-    // ==================== Theme Routes (需认证) ====================
+    // ==================== Theme Routes（登录用户跨环境同步） ====================
 
     if (url.pathname === '/api/user/theme') {
       return handleThemeRoute(request, env);
@@ -391,13 +397,29 @@ async function handleThemeRoute(request: Request, env: Env): Promise<Response> {
   }
 
   if (request.method === 'PUT') {
-    const body = await request.json<Record<string, unknown>>();
-    body.user_id = user.id;
-    body.theme_data = JSON.stringify(body.theme_data);
+    let body: Record<string, unknown>;
+    try {
+      body = await request.json<Record<string, unknown>>();
+    } catch {
+      return Response.json({ error: 'Invalid JSON body' }, { status: 400 });
+    }
+    const rawThemeData = body.theme_data;
+    if (!rawThemeData || typeof rawThemeData !== 'object' || Array.isArray(rawThemeData)) {
+      return Response.json({ error: 'Invalid theme data' }, { status: 400 });
+    }
+    const rawSerializedTheme = JSON.stringify(rawThemeData);
+    if (new TextEncoder().encode(rawSerializedTheme).byteLength > THEME_MAX_BYTES) {
+      return Response.json({ error: 'Theme data is too large' }, { status: 413 });
+    }
+    const themeData = normalizeThemeData(rawThemeData);
+    if (!themeData) {
+      return Response.json({ error: 'Invalid theme data' }, { status: 400 });
+    }
+    const serializedTheme = JSON.stringify(themeData);
     return stub.fetch(new Request('http://internal/internal/theme', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify({ user_id: user.id, theme_data: serializedTheme }),
     }));
   }
 
@@ -644,7 +666,7 @@ async function handleTokenSSHConnection(request: Request, env: Env, token: strin
   const doId = env.SSH_SESSION.idFromName(sessionName);
   // Token 路径：locationHint 由 user-db.handleConnectServer 一次性计算并写入 config
   // （优先级：用户手动 region → DB 持久化的 inferred_hint → undefined）
-  // 这里仅做白名单过滤，零运行时 ipapi 调用
+  // 这里仅做白名单过滤，连接阶段不会再次调用 IPinfo
   const hint = validateRegion(config.locationHint);
   const doStub = hint
     ? env.SSH_SESSION.get(doId, { locationHint: hint } as any)

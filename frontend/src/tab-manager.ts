@@ -1,6 +1,8 @@
-import { SSHTerminal, SSHConnectionConfig, THEMES } from './terminal';
+import { SSHTerminal, SSHConnectionConfig, TerminalSelectionAnchor } from './terminal';
 import { SFTPPanel } from './sftp-panel';
 import { AgentPanel } from './agent/agent-panel';
+import { t } from './i18n';
+import { getNetworkQuality } from './network-quality';
 
 export type TabState = 'connecting' | 'connected' | 'disconnected';
 
@@ -16,6 +18,8 @@ export interface TabInfo {
   cfLatency?: number;
   cfColo?: string;
   wsLatency?: number;
+  selectedText: string;
+  selectionAnchor: TerminalSelectionAnchor | null;
 }
 
 /**
@@ -42,6 +46,7 @@ export class TabManager {
 
   setLoggedIn(loggedIn: boolean): void {
     this._isLoggedIn = loggedIn;
+    this.updateSelectionAction();
   }
 
   setAllTabsClosedHandler(handler: () => void): void {
@@ -89,6 +94,9 @@ export class TabManager {
           tab.agentPanel.dispose();
           tab.agentPanel = null;
         }
+        tab.selectedText = '';
+        tab.selectionAnchor = null;
+        this.updateSelectionAction(tab);
       }
     });
 
@@ -114,11 +122,23 @@ export class TabManager {
           tab.agentPanel = new AgentPanel(tab.containerEl, true);
           tab.agentPanel.render();
           tab.agentPanel.setWebSocketSend((data: string) => tab.terminal.sendWebSocketMessage(data));
+          tab.agentPanel.setTerminalFillHandler(
+            () => ({
+              label: this.getTerminalTargetLabel(tab),
+              available: this.activeTabId === tab.id && tab.state === 'connected',
+            }),
+            (command: string) => {
+              const activeTab = this.getActiveTab();
+              if (activeTab?.id !== tab.id || tab.state !== 'connected') return false;
+              return tab.terminal.fillInput(command);
+            },
+          );
           tab.terminal.setAgentFrameHandler((msg: any) => {
             tab.agentPanel?.handleAgentFrame(msg);
           });
           // AgentPanel 展开/收起时触发终端重新适配尺寸
           tab.agentPanel.setLayoutChangeHandler(() => tab.terminal.fit());
+          this.updateSelectionAction(tab);
         }
       }
     });
@@ -145,9 +165,20 @@ export class TabManager {
       containerEl,
       hostInfo,
       state: 'connecting',
+      selectedText: '',
+      selectionAnchor: null,
     };
 
     this.tabs.set(id, tab);
+    terminal.setSelectionChangeHandler((selection, anchor) => {
+      const currentTab = this.tabs.get(id);
+      if (!currentTab) return;
+      currentTab.selectedText = selection;
+      currentTab.selectionAnchor = anchor;
+      if (this.activeTabId === id) {
+        this.updateSelectionAction(currentTab);
+      }
+    });
     this.switchTab(id);
     this.renderTabBar();
 
@@ -164,6 +195,7 @@ export class TabManager {
     if (this.activeTabId && this.activeTabId !== tabId) {
       const prevTab = this.tabs.get(this.activeTabId);
       if (prevTab) {
+        prevTab.agentPanel?.rejectPendingConfirmation(false);
         prevTab.containerEl.style.display = 'none';
         prevTab.sftpPanel?.hide();
       }
@@ -178,6 +210,7 @@ export class TabManager {
 
     // 更新状态栏
     this.updateStatusBar(tab);
+    this.updateSelectionAction(tab);
     this.renderTabBar();
   }
 
@@ -212,6 +245,7 @@ export class TabManager {
     }
 
     this.renderTabBar();
+    this.updateSelectionAction();
   }
 
   closeAllTabs(): void {
@@ -235,6 +269,7 @@ export class TabManager {
     this.tabs.clear();
     this.activeTabId = null;
     this.renderTabBar();
+    this.updateSelectionAction();
     this.onAllTabsClosed?.();
   }
 
@@ -251,6 +286,18 @@ export class TabManager {
 
   hasAnyTab(): boolean {
     return this.tabs.size > 0;
+  }
+
+  private getTerminalTargetLabel(tab: TabInfo): string {
+    if (!tab.hostInfo) return tab.label;
+    const userPrefix = tab.hostInfo.username ? `${tab.hostInfo.username}@` : '';
+    return `${tab.label} · ${userPrefix}${tab.hostInfo.host}:${tab.hostInfo.port}`;
+  }
+
+  refreshTranslations(): void {
+    this.renderTabBar();
+    const activeTab = this.getActiveTab();
+    if (activeTab) this.updateStatusBar(activeTab);
   }
 
   // ==================== 关闭当前活跃标签 ====================
@@ -270,9 +317,30 @@ export class TabManager {
     if (tab.sftpPanel) {
       tab.sftpPanel.hide();
     }
+    tab.agentPanel?.rejectPendingConfirmation(false);
+    tab.agentPanel?.clearTerminalSelectionContext();
     tab.terminal.disconnect();
     tab.state = 'disconnected';
+    tab.selectedText = '';
+    tab.selectionAnchor = null;
+    this.updateSelectionAction(tab);
     this.renderTabBar();
+  }
+
+  /** 将当前终端选区附加到 Agent 输入区，等待用户补充问题后发送。 */
+  askAIAboutActiveSelection(): boolean {
+    const tab = this.getActiveTab();
+    const selection = tab?.selectedText || '';
+    if (!tab?.agentPanel || !selection.trim()) return false;
+
+    const attached = tab.agentPanel.attachTerminalSelection(
+      selection,
+      this.getTerminalTargetLabel(tab),
+    );
+    if (attached) {
+      tab.terminal.clearSelection();
+    }
+    return attached;
   }
 
   // ==================== 渲染标签栏 ====================
@@ -295,7 +363,7 @@ export class TabManager {
       tabEl.innerHTML = `
         <span class="tab-dot ${dotClass}"></span>
         <span class="tab-label">${this.escapeHtml(tab.label)}</span>
-        <button class="tab-close" title="Close">
+        <button class="tab-close" title="${t('terminal.closeTab')}">
           <span class="material-symbols-outlined" style="font-size:14px;">close</span>
         </button>
       `;
@@ -323,7 +391,7 @@ export class TabManager {
       const btn = document.createElement('button');
       btn.id = 'new-tab-btn';
       btn.className = 'tab-new-btn';
-      btn.title = 'New Connection';
+      btn.title = t('terminal.newConnection');
       btn.innerHTML = '<span class="material-symbols-outlined" style="font-size:16px;">add</span>';
       this.tabBarEl.appendChild(btn);
     }
@@ -339,33 +407,44 @@ export class TabManager {
     const statusText = document.getElementById('status-text');
 
     if (tab.hostInfo) {
-      if (termHost) termHost.textContent = `Host: ${tab.hostInfo.host}`;
-      if (termUser) termUser.textContent = tab.hostInfo.username ? `User: ${tab.hostInfo.username}` : '';
-      if (termPort) termPort.textContent = `Port: ${tab.hostInfo.port}`;
+      if (termHost) termHost.textContent = t('terminal.host', { value: tab.hostInfo.host });
+      if (termUser) termUser.textContent = tab.hostInfo.username ? t('terminal.user', { value: tab.hostInfo.username }) : '';
+      if (termPort) termPort.textContent = t('terminal.port', { value: tab.hostInfo.port });
     } else {
-      if (termHost) termHost.textContent = `Server: ${tab.label}`;
+      if (termHost) termHost.textContent = t('terminal.server', { value: tab.label });
       if (termUser) termUser.textContent = '';
       if (termPort) termPort.textContent = '';
     }
 
     if (tab.state === 'connected') {
-      if (termStatus) termStatus.innerHTML = '<div class="w-2 h-2 bg-primary-container"></div> Connected';
-      if (statusText) statusText.innerHTML = '<span class="w-2 h-2 bg-[var(--accent)] inline-block animate-pulse"></span> STATUS: ONLINE';
+      if (termStatus) termStatus.innerHTML = `<div class="w-2 h-2 bg-primary-container"></div> ${t('terminal.connected')}`;
+      if (statusText) statusText.innerHTML = `<span class="w-2 h-2 bg-[var(--accent)] inline-block animate-pulse"></span> ${t('auth.statusOnline')}`;
     } else if (tab.state === 'connecting') {
-      if (termStatus) termStatus.innerHTML = '<div class="w-2 h-2 bg-primary-container animate-pulse"></div> Connecting';
+      if (termStatus) termStatus.innerHTML = `<div class="w-2 h-2 bg-primary-container animate-pulse"></div> ${t('terminal.connecting')}`;
     } else {
-      if (termStatus) termStatus.innerHTML = '<div class="w-2 h-2 bg-[var(--error)]"></div> Disconnected';
-      if (statusText) statusText.innerHTML = '<span class="w-2 h-2 bg-surface-dot inline-block"></span> STATUS: OFFLINE';
+      if (termStatus) termStatus.innerHTML = `<div class="w-2 h-2 bg-[var(--error)]"></div> ${t('terminal.disconnected')}`;
+      if (statusText) statusText.innerHTML = `<span class="w-2 h-2 bg-surface-dot inline-block"></span> ${t('auth.statusOffline')}`;
     }
 
     // 更新状态栏显示延迟信息
     const termInfo = document.getElementById('term-info');
     if (termInfo) {
       if (tab.state === 'connected') {
-        const cfText = tab.cfLatency !== undefined ? `CF-${tab.cfColo || 'UNK'}: ${tab.cfLatency}ms` : '';
-        const wsText = tab.wsLatency !== undefined ? ` | RTT: ${tab.wsLatency}ms` : '';
-        if (cfText || wsText) {
-          termInfo.textContent = `⚡ ${cfText}${wsText}`;
+        const latencyItems: string[] = [];
+        if (tab.cfLatency !== undefined) {
+          const quality = getNetworkQuality(tab.cfLatency, 'cf');
+          latencyItems.push(
+            `<span class="network-latency-item"><span class="network-quality-dot network-quality-${quality}" aria-hidden="true"></span>CF-${this.escapeHtml(tab.cfColo || 'UNK')}: ${tab.cfLatency}ms</span>`,
+          );
+        }
+        if (tab.wsLatency !== undefined) {
+          const quality = getNetworkQuality(tab.wsLatency, 'ws');
+          latencyItems.push(
+            `<span class="network-latency-item"><span class="network-quality-dot network-quality-${quality}" aria-hidden="true"></span>RTT: ${tab.wsLatency}ms</span>`,
+          );
+        }
+        if (latencyItems.length > 0) {
+          termInfo.innerHTML = `⚡ ${latencyItems.join('<span class="network-latency-separator" aria-hidden="true">|</span>')}`;
         } else {
           termInfo.textContent = '';
         }
@@ -373,6 +452,39 @@ export class TabManager {
         termInfo.textContent = '';
       }
     }
+  }
+
+  private updateSelectionAction(tab: TabInfo | null = this.getActiveTab()): void {
+    const button = document.getElementById('ask-ai-selection-btn');
+    if (!button) return;
+    const visible = !!(
+      this._isLoggedIn
+      && tab
+      && tab.id === this.activeTabId
+      && tab.state === 'connected'
+      && tab.agentPanel
+      && tab.selectedText.trim()
+      && tab.selectionAnchor
+    );
+    button.classList.toggle('hidden', !visible);
+    if (!visible || !tab?.selectionAnchor) return;
+
+    const gap = 12;
+    const viewportPadding = 8;
+    const { clientX, clientY } = tab.selectionAnchor;
+    const terminalBounds = tab.containerEl.getBoundingClientRect();
+    let left = clientX + gap;
+    let top = clientY + gap;
+
+    if (left + button.offsetWidth > terminalBounds.right - viewportPadding) {
+      left = clientX - button.offsetWidth - gap;
+    }
+    if (top + button.offsetHeight > terminalBounds.bottom - viewportPadding) {
+      top = clientY - button.offsetHeight - gap;
+    }
+
+    button.style.left = `${Math.max(terminalBounds.left + viewportPadding, left)}px`;
+    button.style.top = `${Math.max(terminalBounds.top + viewportPadding, top)}px`;
   }
 
   // ==================== 工具函数 ====================

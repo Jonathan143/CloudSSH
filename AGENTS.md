@@ -14,7 +14,7 @@ CloudSSH is a serverless Web SSH terminal built on Cloudflare Workers. Users con
 
 ## Architecture
 
-- **Frontend** (`frontend/`): TypeScript + Vite + xterm.js + Tailwind CSS
+- **Frontend** (`frontend/`): TypeScript + Vite + xterm.js + Tailwind CSS（通过 PostCSS 本地构建）
 - **Backend** (`src/`): Cloudflare Workers + Durable Objects
 - **SSH Protocol**: Pure TypeScript implementation in `src/ssh/` (no external SSH library)
 - **SFTP Protocol**: SFTP v3 subsystem implementation in `src/ssh/sftp.ts` for file management
@@ -29,7 +29,8 @@ src/
 │   ├── durable-object.ts  # SSHSessionDO - manages SSH sessions
 │   ├── ssh-session.ts     # SSH session logic, multi-channel routing, SFTP handling
 │   ├── sftp-handler.ts    # SFTP protocol ops, task queue, concurrent download, upload tracking
-│   ├── user-db.ts    # UserDBDO - user/server storage
+│   ├── user-db.ts    # UserDBDO - user/server storage（含单层标签持久化）
+│   ├── server-tags.ts # 服务器标签规范化与 SQLite JSON 序列化
 │   ├── auth.ts       # GitHub OAuth handling
 │   ├── agent/        # AI Agent system
 │   │   ├── core.ts       # Agent control loop (LLM calls, tool execution)
@@ -49,13 +50,14 @@ src/
 │   ├── kex-curve25519.ts  # Curve25519-SHA256 key exchange
 │   ├── kex-ecdh.ts   # ECDH-NISTP256 key exchange
 │   ├── algorithms.ts # Supported algorithm definitions
-│   ├── auth.ts       # Authentication methods (password, Ed25519 public key)
+│   ├── auth.ts       # Authentication methods (password, Ed25519/ECDSA/RSA private keys)
 │   ├── channel.ts    # SSH channels (session + SFTP subsystem + exec)
 │   ├── crypto.ts     # AES-GCM/CTR cipher, HMAC implementations
 │   ├── keys.ts       # Key derivation per RFC 4253
 │   ├── utils.ts      # Binary utilities
 │   ├── sftp.ts       # SFTP v3 client implementation
 │   └── sftp-types.ts # SFTP protocol constants and types
+├── theme-schema.ts   # Theme V2 shared validation, allowlists, enums, and size limits
 └── types.ts          # Shared TypeScript type definitions
 
 frontend/
@@ -63,11 +65,13 @@ frontend/
 │   ├── main.ts       # Frontend entry point (routing, theme, event handlers)
 │   ├── terminal.ts   # xterm.js terminal setup (search, dynamic RTT latency, log export)
 │   ├── tab-manager.ts # Tab manager (multi-session terminal/SFTP/Agent coordinator)
-│   ├── sftp-panel.ts # SFTP file manager UI (queue, cancel support)
+│   ├── sftp-panel.ts # SFTP file manager UI (multi-select, batch actions, queue, cancel)
+│   ├── sftp-selection.ts # Pure multi-selection state model
 │   ├── auth-form.ts  # Auth form & encrypted anonymous credentials storage/autofill
-│   ├── server-list.ts # Server management UI (card grid, add/edit/delete/connect)
+│   ├── server-list.ts # Server UI (tags, search, 9-card pagination, CRUD/connect)
 │   ├── agent/
-│   │   └── agent-panel.ts  # AI assistant sidebar (streaming output, Markdown rendering, thinking process, confirm dialogs)
+│   │   ├── agent-panel.ts  # AI assistant sidebar (context attachments, streaming, Markdown, confirmations)
+│   │   └── terminal-selection-context.ts # Selection snapshots and untrusted-data prompt boundary
 │   ├── ai-config.ts  # AI model configuration modal
 │   ├── style.css     # Global styles (CSS variable theme system)
 │   └── turnstile.d.ts # Turnstile type declarations
@@ -89,8 +93,20 @@ pnpm run deploy:test
 # Build frontend only (required before deploy)
 pnpm run build:frontend
 
+# Synchronize GitHub Pages theme presets from frontend/src/theme.ts
+pnpm run sync:theme-editor
+
 # Run tests
 pnpm test
+
+# Run worker + frontend type checks
+pnpm run typecheck
+
+# Run browser E2E and accessibility tests
+pnpm run test:e2e
+
+# Run the complete local quality gate
+pnpm run verify
 
 # Install frontend dependencies (separate from root)
 cd frontend && pnpm install
@@ -114,7 +130,7 @@ Two Durable Objects handle state:
 1. **SSHSessionDO** (`src/worker/durable-object.ts`)
    - Manages WebSocket ↔ TCP socket connections
    - Handles SSH session lifecycle
-   - Uses Hibernation API for long-lived connections
+   - Accepts browser WebSockets through the Hibernation API, but active outbound SSH TCP sockets keep the DO awake and prevent hibernation during a live session
 
 2. **UserDBDO** (`src/worker/user-db.ts`)
    - SQLite-based user and server storage
@@ -136,10 +152,10 @@ Required for optional features (configured in `wrangler.toml` or Cloudflare Dash
 | `/api/auth/callback` | GET | No | OAuth callback, creates user + session |
 | `/api/auth/logout` | POST | No | Logout, clears session |
 | `/api/auth/me` | GET | Yes | Returns current user info |
-| `/api/servers` | GET/POST | Yes | List or create saved servers |
-| `/api/servers/:id` | PUT/DELETE | Yes | Update or delete a server |
+| `/api/servers` | GET/POST | Yes | List or create saved servers（含单层 `tags`） |
+| `/api/servers/:id` | PUT/DELETE | Yes | Update or delete a server（含标签更新） |
 | `/api/servers/:id/connect` | POST | Yes | Generate one-time-token, return WebSocket URL |
-| `/api/user/theme` | GET/PUT | Yes | Get or save user custom theme |
+| `/api/user/theme` | GET/PUT | Yes | Get or replace the signed-in user's single custom theme |
 | `/api/known-hosts` | GET/POST/DELETE | Yes | Known host fingerprint CRUD (TOFU) |
 | `/api/ai/config` | GET/PUT | Yes | Get or save AI LLM config |
 | `/api/ai/models` | POST | Yes | Proxy model list from user's LLM provider |
@@ -208,6 +224,13 @@ ci: CI/CD 变更
 7. **Agent tool confirmations** - Dangerous commands (rm -rf, shutdown, etc.) require user confirmation via `agent_confirm` WebSocket message before execution. Blocked commands (rm -rf /, fork bomb, etc.) are rejected outright without prompting.
 8. **Agent loop timeouts & Watchdog** - The agent run loop has a step-based timeout of 60 seconds (managed by a watchdog timer in `agent/core.ts` that resets after each LLM response or tool execution). When waiting for user confirmation via `agent_confirm`, the watchdog timer is paused to prevent timeouts due to user delays.
 9. **SSH rate limiting** - `/api/ssh` uses a bounded, Worker-isolate in-memory limiter for traffic shedding. It skips requests without `CF-Connecting-IP`; Turnstile and one-time tokens remain the connection authorization controls.
+10. **Tailwind is built locally** - `frontend/postcss.config.cjs` and `frontend/tailwind.config.cjs` generate Tailwind CSS during Vite builds. Do not reintroduce `cdn.tailwindcss.com`; keep content scan paths and theme variable mappings synchronized when adding frontend source locations or theme tokens.
+11. **Builds never install dependencies** - run `pnpm install --frozen-lockfile` before build/deploy. `scripts/build-html.js` requires exactly one JS and one CSS bundle so every production asset is inlined deterministically.
+12. **Server list organization** - server tags are stored as normalized JSON in SQLite, filtered client-side, and rendered with 9 items per page. Search/tag changes must reset pagination to page 1.
+13. **SFTP selection model** - file selection supports single, Cmd/Ctrl toggle, Shift range and select-all. Batch download reuses the sequential download queue; batch delete waits for all delete/rmdir results before refreshing.
+14. **Agent terminal selection context** - “Ask AI assistant” attaches one immutable selection snapshot per tab and never sends it by itself. New selections replace the pending snapshot; successful sends and session teardown clear it. Preserve the untrusted-data/non-authorization boundary in `terminal-selection-context.ts`.
+15. **Region inference privacy** - Saving or changing a server host calls the third-party IPinfo service and persists the inferred locationHint. Keep the provider name and disclosure synchronized across README/code comments; failures must continue to fall back to Cloudflare's default placement.
+16. **Theme editor ownership** - The full visual editor and JSON export live in `docs/theme-editor/index.html` for GitHub Pages and never authenticate against CloudSSH. `scripts/sync-theme-editor.js` keeps its built-in colors and resolved appearance presets aligned with `frontend/src/theme.ts`; the application and Worker share Theme V2 validation through `src/theme-schema.ts`. The application only imports JSON themes and synchronizes the single custom-theme slot through `/api/user/theme` for signed-in users; later imports replace the previous theme, while anonymous themes remain local.
 
 ## Deployment Notes
 
@@ -258,9 +281,10 @@ pnpm run deploy:test     # 部署 test 环境
 Dashboard: Workers → 你的 Worker → Settings → Variables → Environment Variables
 CLI: `npx wrangler secret set <SECRET_NAME>`
 
-### 首次部署注意
+### 首次部署与迁移注意
 
-- 新 Durable Objects 首次部署：先删除旧 worker 再重新部署（`npx wrangler delete <worker-name>`）
+- 新 Durable Object 类必须通过 `wrangler.toml` 中新的、不可复用的 migration tag 部署；已有环境不得通过删除 Worker 作为常规初始化或迁移方式
+- 只有确认环境中没有需要保留的数据、且明确要重建整个环境时，才可删除 Worker
 - Test 环境 DO 绑定与 production 相同的 class_name，但因 Worker 名称不同，数据完全隔离
 
 ## AI 版本发布与文档维护规范

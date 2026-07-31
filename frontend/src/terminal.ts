@@ -5,6 +5,15 @@ import { WebglAddon } from '@xterm/addon-webgl';
 import { SearchAddon } from '@xterm/addon-search';
 import { TrzszFilter } from 'trzsz';
 import '@xterm/xterm/css/xterm.css';
+import { copyTextToClipboard } from './clipboard';
+import { t } from './i18n';
+import { notify } from './ui-feedback';
+import { centerTerminalText } from './terminal-text';
+import { localizedSSHMessage } from './terminal-status';
+import {
+  getActiveTerminalTheme,
+  onTerminalThemeChange,
+} from './theme';
 
 const TRZSZ_MAX_DATA_CHUNK_SIZE = 2 * 1024 * 1024;
 
@@ -20,120 +29,14 @@ export interface SSHConnectionConfig {
   locationHint?: string;
 }
 
+export interface TerminalSelectionAnchor {
+  clientX: number;
+  clientY: number;
+}
+
 interface ConnectOptions {
   resetDisplay?: boolean;
 }
-
-export const THEMES = {
-  cyberpunk: {
-    background: '#0a0a0a',
-    foreground: '#4af626',
-    cursor: '#14d1ff',
-    cursorAccent: '#0a0a0a',
-    selectionBackground: '#273747',
-  },
-  glacier: {
-    background: '#0a192f',
-    foreground: '#64ffda',
-    cursor: '#e6f1ff',
-    cursorAccent: '#0a192f',
-    selectionBackground: '#112240',
-  },
-  gruvbox: {
-    background: '#282828',
-    foreground: '#ebdbb2',
-    cursor: '#d3869b',
-    cursorAccent: '#282828',
-    selectionBackground: '#504945',
-  }
-};
-
-export const UI_THEMES: Record<keyof typeof THEMES, Record<string, string>> = {
-  cyberpunk: {
-    '--bg': '#0a0a0a',
-    '--bg-surface': '#121212',
-    '--bg-elevated': '#131313',
-    '--bg-terminal': '#0e0e0e',
-    '--text': '#4af626',
-    '--text-muted': '#bbccb0',
-    '--text-dim': '#3c4b36',
-    '--accent': '#4af626',
-    '--accent-secondary': '#14d1ff',
-    '--accent-secondary-light': '#b7eaff',
-    '--border': '#1f1f1f',
-    '--border-strong': '#3c4b36',
-    '--error': '#ffb4ab',
-    '--error-bg': '#93000a',
-    '--on-accent': '#022100',
-    '--surface-dot': '#353534',
-    '--scrollbar-track': 'rgba(28, 27, 27, 0.5)',
-    '--scrollbar-thumb': 'rgba(60, 75, 54, 0.8)',
-    '--scrollbar-thumb-hover': 'rgba(134, 149, 125, 0.8)',
-    '--scanline-tint': 'rgba(74, 246, 38, 0.02)',
-    '--accent-glow': 'rgba(74, 246, 38, 0.08)',
-    '--modal-overlay': 'rgba(0, 0, 0, 0.8)',
-    '--on-surface': '#e5e2e1',
-    '--on-surface-variant': '#bbccb0',
-    '--agent-user-color': '#4af626',
-    '--agent-agent-color': '#14d1ff',
-  },
-  glacier: {
-    '--bg': '#0a192f',
-    '--bg-surface': '#0d2137',
-    '--bg-elevated': '#112240',
-    '--bg-terminal': '#061526',
-    '--text': '#64ffda',
-    '--text-muted': '#8892b0',
-    '--text-dim': '#495670',
-    '--accent': '#64ffda',
-    '--accent-secondary': '#e6f1ff',
-    '--accent-secondary-light': '#ccd6f6',
-    '--border': '#1d3557',
-    '--border-strong': '#495670',
-    '--error': '#ff6b6b',
-    '--error-bg': '#3d0000',
-    '--on-accent': '#0a192f',
-    '--surface-dot': '#1d3557',
-    '--scrollbar-track': 'rgba(10, 25, 47, 0.5)',
-    '--scrollbar-thumb': 'rgba(100, 255, 218, 0.2)',
-    '--scrollbar-thumb-hover': 'rgba(100, 255, 218, 0.4)',
-    '--scanline-tint': 'rgba(100, 255, 218, 0.02)',
-    '--accent-glow': 'rgba(100, 255, 218, 0.08)',
-    '--modal-overlay': 'rgba(0, 0, 0, 0.85)',
-    '--on-surface': '#e6f1ff',
-    '--on-surface-variant': '#8892b0',
-    '--agent-user-color': '#64ffda',
-    '--agent-agent-color': '#e6f1ff',
-  },
-  gruvbox: {
-    '--bg': '#282828',
-    '--bg-surface': '#303030',
-    '--bg-elevated': '#282828',
-    '--bg-terminal': '#1d2021',
-    '--text': '#ebdbb2',
-    '--text-muted': '#a89984',
-    '--text-dim': '#665c54',
-    '--accent': '#b8bb26',
-    '--accent-secondary': '#83a598',
-    '--accent-secondary-light': '#8ec07c',
-    '--border': '#3c3836',
-    '--border-strong': '#665c54',
-    '--error': '#fb4934',
-    '--error-bg': '#3d0000',
-    '--on-accent': '#282828',
-    '--surface-dot': '#3c3836',
-    '--scrollbar-track': 'rgba(40, 40, 40, 0.5)',
-    '--scrollbar-thumb': 'rgba(168, 153, 132, 0.3)',
-    '--scrollbar-thumb-hover': 'rgba(168, 153, 132, 0.5)',
-    '--scanline-tint': 'rgba(184, 187, 38, 0.02)',
-    '--accent-glow': 'rgba(184, 187, 38, 0.08)',
-    '--modal-overlay': 'rgba(0, 0, 0, 0.75)',
-    '--on-surface': '#ebdbb2',
-    '--on-surface-variant': '#a89984',
-    '--agent-user-color': '#b8bb26',
-    '--agent-agent-color': '#83a598',
-  },
-};
 
 export class SSHTerminal {
   private terminal: Terminal;
@@ -165,7 +68,36 @@ export class SSHTerminal {
   private lastPingTime: number | null = null;
   private wsLatency: number | null = null;
   private onLatencyUpdated?: (cfLatency: number | null, cfColo: string | null, wsLatency: number | null) => void;
+  private onSelectionChanged?: (selection: string, anchor: TerminalSelectionAnchor | null) => void;
+  private selectionAnchor: TerminalSelectionAnchor | null = null;
+  private selectionPointerActive = false;
+  private themeCleanup: () => void;
   private resizeListener: () => void;
+  private readonly selectionPointerDownListener = (event: PointerEvent): void => {
+    if (event.button !== 0) return;
+    this.selectionPointerActive = true;
+    this.selectionAnchor = { clientX: event.clientX, clientY: event.clientY };
+  };
+  private readonly selectionPointerMoveListener = (event: PointerEvent): void => {
+    if (!this.selectionPointerActive) return;
+    this.selectionAnchor = { clientX: event.clientX, clientY: event.clientY };
+    if (this.terminal.hasSelection()) {
+      this.notifySelectionChanged();
+    }
+  };
+  private readonly selectionPointerUpListener = (event: PointerEvent): void => {
+    if (!this.selectionPointerActive) return;
+    this.selectionPointerActive = false;
+    this.selectionAnchor = { clientX: event.clientX, clientY: event.clientY };
+    this.notifySelectionChanged();
+    const selection = this.terminal.getSelection();
+    if (selection) {
+      void this.copySelectionToClipboard(selection);
+    }
+  };
+  private readonly selectionPointerCancelListener = (): void => {
+    this.selectionPointerActive = false;
+  };
 
   constructor(containerId: string) {
     this.container = document.getElementById(containerId)!;
@@ -176,7 +108,7 @@ export class SSHTerminal {
       cursorStyle: 'block',
       fontSize: 14,
       fontFamily: '"JetBrains Mono", "Fira Code", "Cascadia Code", monospace',
-      theme: THEMES.cyberpunk,
+      theme: getActiveTerminalTheme(),
       allowProposedApi: true,
       scrollback: 10000,
     });
@@ -186,7 +118,19 @@ export class SSHTerminal {
     this.terminal.loadAddon(new WebLinksAddon());
     this.searchAddon = new SearchAddon();
     this.terminal.loadAddon(this.searchAddon);
+    this.themeCleanup = onTerminalThemeChange((theme) => {
+      this.terminal.options.theme = theme;
+    });
     this.registerCursorRestoreHandlers();
+    this.terminalDisposables.push(
+      this.terminal.onSelectionChange(() => {
+        this.notifySelectionChanged();
+      }),
+    );
+    this.container.addEventListener('pointerdown', this.selectionPointerDownListener, true);
+    this.container.addEventListener('pointermove', this.selectionPointerMoveListener, true);
+    window.addEventListener('pointerup', this.selectionPointerUpListener, true);
+    window.addEventListener('pointercancel', this.selectionPointerCancelListener, true);
 
     // Ctrl+Shift+F to toggle search bar
     this.terminal.attachCustomKeyEventHandler((e: KeyboardEvent) => {
@@ -204,7 +148,7 @@ export class SSHTerminal {
 
     window.addEventListener('resize', this.resizeListener);
 
-    // Right-click paste support
+    // 右键粘贴（选区已通过鼠标松手自动复制到剪贴板）
     this.container.addEventListener('contextmenu', async (e) => {
       e.preventDefault();
       try {
@@ -233,30 +177,6 @@ export class SSHTerminal {
     });
   }
 
-  setTheme(themeName: keyof typeof THEMES): void {
-    this.terminal.options.theme = THEMES[themeName];
-    const uiVars = UI_THEMES[themeName];
-    if (uiVars) {
-      const root = document.documentElement;
-      Object.entries(uiVars).forEach(([prop, val]) => {
-        root.style.setProperty(prop, val);
-      });
-    }
-    localStorage.setItem('cloudssh_theme', themeName);
-  }
-
-  applyImportedTheme(data: { terminal?: Record<string, string>; ui?: Record<string, string> }): void {
-    if (data.terminal) {
-      this.terminal.options.theme = data.terminal as any;
-    }
-    if (data.ui) {
-      const root = document.documentElement;
-      Object.entries(data.ui).forEach(([prop, val]) => {
-        root.style.setProperty(prop, val);
-      });
-    }
-  }
-
   setSessionClosedHandler(handler: (event: CloseEvent) => void): void {
     this.onSessionClosed = handler;
   }
@@ -275,6 +195,16 @@ export class SSHTerminal {
     }
   }
 
+  /** 将文本填入当前远端终端输入行，不附加回车。 */
+  fillInput(text: string): boolean {
+    if (!text || /[\r\n]/.test(text)) return false;
+    if (this.ws?.readyState !== WebSocket.OPEN || !this.trzszFilter) return false;
+
+    this.trzszFilter.processTerminalInput(text);
+    this.terminal.focus();
+    return true;
+  }
+
   setLatencyUpdatedHandler(handler: (cfLatency: number | null, cfColo: string | null, wsLatency: number | null) => void): void {
     this.onLatencyUpdated = handler;
     if (this.cfLatency !== null || this.cfColo !== null || this.wsLatency !== null) {
@@ -282,8 +212,37 @@ export class SSHTerminal {
     }
   }
 
+  setSelectionChangeHandler(handler: (selection: string, anchor: TerminalSelectionAnchor | null) => void): void {
+    this.onSelectionChanged = handler;
+    this.notifySelectionChanged();
+  }
+
+  clearSelection(): void {
+    this.terminal.clearSelection();
+    this.selectionAnchor = null;
+    this.notifySelectionChanged();
+  }
+
   getSFTPWebSocketUrl(): string | null {
     return this.sftpAttachUrl;
+  }
+
+  private notifySelectionChanged(): void {
+    const selection = this.terminal.getSelection();
+    if (!selection) {
+      this.selectionAnchor = null;
+    }
+    this.onSelectionChanged?.(selection, this.selectionAnchor);
+  }
+
+  /** 将选中文字写入剪贴板，并按实际复制结果提供反馈。 */
+  private async copySelectionToClipboard(text: string): Promise<void> {
+    const copied = await copyTextToClipboard(text);
+    if (!copied) {
+      notify(t('terminal.copyFailed'), { variant: 'danger' });
+      return;
+    }
+    notify(t('terminal.copySuccess'), { variant: 'success', duration: 1500 });
   }
 
   mount(): void {
@@ -317,14 +276,14 @@ export class SSHTerminal {
     box.className = 'cloudssh-search-box';
     box.style.display = 'none';
     box.innerHTML = `
-      <input type="text" class="cloudssh-search-input" placeholder="Search..." />
-      <button class="cloudssh-search-btn cloudssh-search-prev" title="Previous (Shift+Enter)">
+      <input type="text" class="cloudssh-search-input" placeholder="${t('terminal.searchPlaceholder')}" />
+      <button class="cloudssh-search-btn cloudssh-search-prev" title="${t('terminal.searchPrevious')}">
         <span class="material-symbols-outlined" style="font-size:16px;">arrow_upward</span>
       </button>
-      <button class="cloudssh-search-btn cloudssh-search-next" title="Next (Enter)">
+      <button class="cloudssh-search-btn cloudssh-search-next" title="${t('terminal.searchNext')}">
         <span class="material-symbols-outlined" style="font-size:16px;">arrow_downward</span>
       </button>
-      <button class="cloudssh-search-btn cloudssh-search-close" title="Close (Esc)">
+      <button class="cloudssh-search-btn cloudssh-search-close" title="${t('terminal.searchClose')}">
         <span class="material-symbols-outlined" style="font-size:16px;">close</span>
       </button>
     `;
@@ -428,7 +387,7 @@ export class SSHTerminal {
     }
 
     const termStatus = document.getElementById('term-status');
-    if (termStatus) termStatus.innerHTML = '<div class="w-2 h-2 bg-primary-container animate-pulse"></div> Connected';
+    if (termStatus) termStatus.innerHTML = `<div class="w-2 h-2 bg-primary-container animate-pulse"></div> ${t('terminal.connecting')}`;
 
     const wsUrl = new URL(window.location.href);
     wsUrl.protocol = wsUrl.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -444,7 +403,7 @@ export class SSHTerminal {
       this.ws.binaryType = 'arraybuffer';
 
       this.ws.onopen = () => {
-        this.terminal.writeln('\x1b[32m[+] WebSocket connected, sending credentials...\x1b[0m');
+        this.terminal.writeln(`\x1b[32m[+] ${t('terminal.wsSendingCredentials')}\x1b[0m`);
         this.ws?.send(JSON.stringify({
           host: config.host,
           port: config.port,
@@ -461,7 +420,7 @@ export class SSHTerminal {
       };
 
       this.ws.onerror = () => {
-        reject(new Error('WebSocket connection failed'));
+        reject(new Error(t('terminal.wsFailed')));
       };
 
       this.setupWebSocketHandlers(reject);
@@ -477,10 +436,10 @@ export class SSHTerminal {
     this.showConnectingBanner();
 
     const termStatus = document.getElementById('term-status');
-    if (termStatus) termStatus.innerHTML = '<div class="w-2 h-2 bg-primary-container animate-pulse"></div> Connected';
+    if (termStatus) termStatus.innerHTML = `<div class="w-2 h-2 bg-primary-container animate-pulse"></div> ${t('terminal.connecting')}`;
 
     ws.onopen = () => {
-      this.terminal.writeln('\x1b[32m[+] WebSocket connected, authenticating...\x1b[0m');
+      this.terminal.writeln(`\x1b[32m[+] ${t('terminal.wsAuthenticating')}\x1b[0m`);
       this.sendResize();
       this.startHeartbeat();
     };
@@ -534,18 +493,18 @@ export class SSHTerminal {
 
           switch (msg.type) {
             case 'status':
-              this.terminal.writeln(`\x1b[32m[*] ${msg.message}\x1b[0m`);
+              this.terminal.writeln(`\x1b[32m[*] ${localizedSSHMessage(msg.message, msg.event, msg.params)}\x1b[0m`);
               if (msg.event === 'auth_success' || msg.message === '认证成功') {
                 this.reconnectAttempts = 0;
                 const statusText = document.getElementById('status-text');
-                if (statusText) statusText.innerHTML = '<span class="w-2 h-2 bg-[var(--accent)] inline-block animate-pulse"></span> STATUS: ONLINE';
+                if (statusText) statusText.innerHTML = `<span class="w-2 h-2 bg-[var(--accent)] inline-block animate-pulse"></span> ${t('auth.statusOnline')}`;
               }
               if (msg.event === 'shell_ready' || msg.message === 'Shell 已就绪') {
                 this.onSessionReady?.();
               }
               break;
             case 'error':
-              this.terminal.writeln(`\x1b[31m[!] ${msg.message}\x1b[0m`);
+              this.terminal.writeln(`\x1b[31m[!] ${localizedSSHMessage(msg.message, msg.event, msg.params)}\x1b[0m`);
               break;
             case 'debug':
               this.terminal.writeln(`\x1b[90m[DEBUG] ${msg.message}\x1b[0m`);
@@ -580,12 +539,12 @@ export class SSHTerminal {
 
       this.stopHeartbeat();
       this.terminal.writeln(
-        `\x1b[33m[*] Connection closed (code=${event.code})\x1b[0m`
+        `\x1b[33m[*] ${t('terminal.connectionClosed', { code: event.code })}\x1b[0m`
       );
       const termStatus = document.getElementById('term-status');
-      if (termStatus) termStatus.innerHTML = '<div class="w-2 h-2 bg-[var(--error)]"></div> Disconnected';
+      if (termStatus) termStatus.innerHTML = `<div class="w-2 h-2 bg-[var(--error)]"></div> ${t('terminal.disconnected')}`;
       const statusText = document.getElementById('status-text');
-      if (statusText) statusText.innerHTML = '<span class="w-2 h-2 bg-surface-dot inline-block"></span> STATUS: OFFLINE';
+      if (statusText) statusText.innerHTML = `<span class="w-2 h-2 bg-surface-dot inline-block"></span> ${t('auth.statusOffline')}`;
       
       if (event.code === 1000) {
         this.onSessionClosed?.(event);
@@ -598,8 +557,8 @@ export class SSHTerminal {
     };
 
     this.ws.onerror = () => {
-      this.terminal.writeln('\x1b[31m[!] Connection error\x1b[0m');
-      if (rejectFn) rejectFn(new Error('WebSocket connection failed'));
+      this.terminal.writeln(`\x1b[31m[!] ${t('terminal.connectionError')}\x1b[0m`);
+      if (rejectFn) rejectFn(new Error(t('terminal.wsFailed')));
     };
 
     // User input goes through trzsz filter
@@ -684,9 +643,10 @@ export class SSHTerminal {
 
   private showConnectingBanner(): void {
     this.resetTerminalDisplay();
+    const bannerText = centerTerminalText(t('terminal.bannerConnecting'), 34);
     this.terminal.write(
       '\x1b[1;33m╔══════════════════════════════════╗\x1b[0m\r\n' +
-      '\x1b[1;33m║      Connecting to CloudSSH      ║\x1b[0m\r\n' +
+      `\x1b[1;33m║${bannerText}║\x1b[0m\r\n` +
       '\x1b[1;33m╚══════════════════════════════════╝\x1b[0m\r\n\r\n'
     );
   }
@@ -736,16 +696,16 @@ export class SSHTerminal {
     this.reconnectAttempts++;
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
     
-    this.terminal.writeln(`\x1b[33m[*] Reconnecting in ${delay / 1000}s (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})...\x1b[0m`);
+    this.terminal.writeln(`\x1b[33m[*] ${t('terminal.reconnectWait', { seconds: delay / 1000, attempt: this.reconnectAttempts, max: this.maxReconnectAttempts })}\x1b[0m`);
     
     this.reconnectTimeout = setTimeout(async () => {
       this.reconnectTimeout = null;
       if (this.lastConfig) {
-        this.terminal.writeln('\x1b[32m[+] Reconnecting...\x1b[0m');
+        this.terminal.writeln(`\x1b[32m[+] ${t('terminal.reconnecting')}\x1b[0m`);
         try {
           await this.connect(this.lastConfig, { resetDisplay: false });
         } catch (e) {
-          this.terminal.writeln('\x1b[31m[!] Reconnect failed\x1b[0m');
+          this.terminal.writeln(`\x1b[31m[!] ${t('terminal.reconnectFailed')}\x1b[0m`);
         }
       }
     }, delay);
@@ -761,6 +721,11 @@ export class SSHTerminal {
   dispose(): void {
     this.disconnect();
     window.removeEventListener('resize', this.resizeListener);
+    this.container.removeEventListener('pointerdown', this.selectionPointerDownListener, true);
+    this.container.removeEventListener('pointermove', this.selectionPointerMoveListener, true);
+    window.removeEventListener('pointerup', this.selectionPointerUpListener, true);
+    window.removeEventListener('pointercancel', this.selectionPointerCancelListener, true);
+    this.themeCleanup();
     this.terminalDisposables.forEach(d => d.dispose());
     this.terminalDisposables = [];
     this.terminal.dispose();
