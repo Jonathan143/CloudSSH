@@ -119,14 +119,16 @@ export class AgentPanel {
     this.panelEl.style.display = 'none';
 
     this.panelEl.innerHTML = `
-      <div class="flex items-center justify-between px-4 py-2.5 border-b border-[var(--border)] bg-[var(--bg-elevated)]">
+      <div class="agent-panel-header flex items-center justify-between px-4 py-2.5 border-b border-[var(--border)] bg-[var(--bg-elevated)]">
         <span class="text-xs font-bold tracking-[0.1em] text-[var(--accent-secondary)]" data-i18n="agent.title">AI Agent 助手</span>
-        <button id="agent-close-btn" class="text-muted hover:text-primary transition-colors cursor-pointer" data-i18n-title="agent.close" title="关闭 Agent 面板">
-          <span class="material-symbols-outlined" style="font-size:18px;">close</span>
+        <button id="agent-close-btn" class="agent-close-button text-muted hover:text-primary transition-colors cursor-pointer" data-i18n-title="agent.backToTerminal" data-i18n-aria-label="agent.backToTerminal" title="返回终端" aria-label="返回终端">
+          <span class="agent-mobile-back material-symbols-outlined" style="font-size:18px;" aria-hidden="true">arrow_back</span>
+          <span class="agent-mobile-back agent-back-label" data-i18n="agent.backToTerminal">返回终端</span>
+          <span class="agent-desktop-close material-symbols-outlined" style="font-size:18px;" aria-hidden="true">close</span>
         </button>
       </div>
       <div id="agent-messages" class="flex-1 overflow-y-auto px-4 py-3 space-y-3 custom-scrollbar text-[13px]"></div>
-      <div class="px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-elevated)]">
+      <div class="agent-panel-composer px-4 py-3 border-t border-[var(--border)] bg-[var(--bg-elevated)]">
         <div id="agent-context" class="agent-context-container hidden"></div>
         <div class="flex gap-2.5 items-end">
           <textarea id="agent-input" data-i18n-placeholder="agent.placeholder" placeholder="描述你希望 Agent 完成的任务…"

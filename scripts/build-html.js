@@ -8,12 +8,29 @@ const distDir = path.join(frontendDir, 'dist');
 const workerDir = path.join(rootDir, 'src', 'worker');
 const htmlTsFile = path.join(workerDir, 'html.ts');
 
+function inlineRequiredAsset(html, patterns, replacement, assetType) {
+  for (const pattern of patterns) {
+    if (pattern.test(html)) {
+      return html.replace(pattern, replacement);
+    }
+  }
+  throw new Error(`Unable to find the ${assetType} reference in the generated frontend HTML.`);
+}
+
 console.log('Building frontend...');
 try {
   execFileSync(process.execPath, ['scripts/sync-theme-editor.js'], { cwd: rootDir, stdio: 'inherit' });
   // Dependencies are installed explicitly by developers/CI. Keeping installs out
   // of the build makes production artifacts deterministic and offline-buildable.
-  execFileSync('pnpm', ['run', 'build'], { cwd: frontendDir, stdio: 'inherit' });
+  const executableSuffix = process.platform === 'win32' ? '.cmd' : '';
+  execFileSync(path.join(frontendDir, 'node_modules', '.bin', `tsc${executableSuffix}`), [], {
+    cwd: frontendDir,
+    stdio: 'inherit',
+  });
+  execFileSync(path.join(frontendDir, 'node_modules', '.bin', `vite${executableSuffix}`), ['build'], {
+    cwd: frontendDir,
+    stdio: 'inherit',
+  });
 
   console.log('Inlining assets...');
   // 2. Read dist/index.html
@@ -46,12 +63,16 @@ try {
   }
 
   // 5. Inline CSS (replace <link rel="stylesheet" ...>)
-  html = html.replace(/<link[^>]*rel=["']stylesheet["'][^>]*href=["']\/assets\/[^"']+["'][^>]*>/i, () => `<style>${cssContent}</style>`);
-  html = html.replace(/<link[^>]*rel=["']stylesheet["'][^>]*href=["']\/src\/[^"']+["'][^>]*>/i, () => `<style>${cssContent}</style>`);
+  html = inlineRequiredAsset(html, [
+    /<link[^>]*rel=["']stylesheet["'][^>]*href=["']\/assets\/[^"']+["'][^>]*>/i,
+    /<link[^>]*rel=["']stylesheet["'][^>]*href=["']\/src\/[^"']+["'][^>]*>/i,
+  ], () => `<style>${cssContent}</style>`, 'stylesheet');
 
   // 6. Inline JS (replace <script type="module" src="/src/main.ts"></script> or similar)
-  html = html.replace(/<script[^>]*type=["']module["'][^>]*src=["']\/assets\/[^"']+["'][^>]*><\/script>/i, () => `<script type="module">${jsContent}</script>`);
-  html = html.replace(/<script[^>]*type=["']module["'][^>]*src=["']\/src\/[^"']+["'][^>]*><\/script>/i, () => `<script type="module">${jsContent}</script>`);
+  html = inlineRequiredAsset(html, [
+    /<script[^>]*type=["']module["'][^>]*src=["']\/assets\/[^"']+["'][^>]*><\/script>/i,
+    /<script[^>]*type=["']module["'][^>]*src=["']\/src\/[^"']+["'][^>]*><\/script>/i,
+  ], () => `<script type="module">${jsContent}</script>`, 'module script');
 
   // 7. Write to src/worker/html.ts
   const escapedHtml = html

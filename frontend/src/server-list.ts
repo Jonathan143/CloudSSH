@@ -2,6 +2,11 @@ import { populateRegionSelect, regionLabel } from './regions';
 import { confirmAction, notify } from './ui-feedback';
 import { onLocaleChange, t } from './i18n';
 import { parsePort } from './port';
+import { copyTextToClipboard } from './clipboard';
+import { maskIPAddress } from './host-display';
+import { osDisplayName, osIconSvg } from './os-icons';
+import type { SSHHostInfo } from './terminal';
+import { ShareManager } from './share-manager';
 
 interface UserInfo {
   id: number;
@@ -21,11 +26,46 @@ export interface ServerConfig {
   region?: string | null;
   inferred_hint?: string | null;
   tags: string[];
+  /** 连接时检测到的远端操作系统（canonical key，如 ubuntu/debian/centos） */
+  os?: string | null;
+  jump_server_id?: number | null;
   created_at: string;
   updated_at: string;
 }
 
+interface ServerSavePayload {
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  auth_method: 'password' | 'publickey';
+  tags: string[];
+  credential?: string;
+  region?: string;
+  jump_server_id?: number | null;
+}
+
+interface ServerSaveResponse {
+  inferred_hint?: string | null;
+  _debug?: unknown;
+}
+
 export const SERVER_PAGE_SIZE = 9;
+export const TABLET_SERVER_PAGE_SIZE = 6;
+export const MOBILE_SERVER_PAGE_SIZE = 3;
+
+export function resolveServerPageSize(viewportWidth: number, coarsePointer: boolean): number {
+  if (viewportWidth < 768) return MOBILE_SERVER_PAGE_SIZE;
+  if (viewportWidth <= 1180 && coarsePointer) return TABLET_SERVER_PAGE_SIZE;
+  return SERVER_PAGE_SIZE;
+}
+
+function currentServerPageSize(): number {
+  return resolveServerPageSize(
+    window.innerWidth,
+    window.matchMedia('(pointer: coarse)').matches,
+  );
+}
 
 export function normalizeTagsInput(value: string): string[] {
   const tags: string[] = [];
@@ -80,18 +120,21 @@ export class ServerList {
   private user: UserInfo;
   private servers: ServerConfig[] = [];
   private onLogout: () => void;
-  private onConnect: (wsUrl: string, serverName: string, hostInfo?: { host: string; port: number; username?: string }) => void;
+  private onConnect: (wsUrl: string, serverName: string, hostInfo?: SSHHostInfo) => void;
   private editingServerId: number | null = null;
   private editingOriginalAuthMethod: ServerConfig['auth_method'] | null = null;
   private modalAuthMode: 'password' | 'key' = 'password';
   private searchQuery = '';
   private selectedTag = '';
   private currentPage = 1;
+  private pageSize = currentServerPageSize();
+  private sharingEnabled = false;
+  private readonly shareManager = new ShareManager();
 
   constructor(
     user: UserInfo,
     onLogout: () => void,
-    onConnect: (wsUrl: string, serverName: string, hostInfo?: { host: string; port: number; username?: string }) => void
+    onConnect: (wsUrl: string, serverName: string, hostInfo?: SSHHostInfo) => void
   ) {
     this.user = user;
     this.onLogout = onLogout;
@@ -103,11 +146,28 @@ export class ServerList {
   private async init(): Promise<void> {
     this.renderUserInfo();
     this.bindEvents();
-    await this.fetchServers();
+    await Promise.all([this.fetchSharingConfig(), this.fetchServers()]);
+    this.renderServerGrid();
 
     // 设置用户空间的版权年份
     const yearSpan = document.getElementById('user-copyright-year');
     if (yearSpan) yearSpan.textContent = new Date().getFullYear().toString();
+  }
+
+  refreshPageSize(): void {
+    const nextPageSize = currentServerPageSize();
+    if (nextPageSize === this.pageSize) return;
+    this.pageSize = nextPageSize;
+    this.currentPage = 1;
+    this.renderServerGrid();
+  }
+
+  /** 连接后由 os_detected 消息回调：更新某台服务器的操作系统并即时重渲染图标 */
+  updateServerOS(serverId: number, os: string | null): void {
+    const server = this.servers.find((s) => s.id === serverId);
+    if (!server || server.os === os) return;
+    server.os = os;
+    this.renderServerGrid();
   }
 
   // ==================== 渲染用户信息 ====================
@@ -188,6 +248,7 @@ export class ServerList {
     // Modal 认证方式切换
     document.getElementById('modal-auth-tab-password')?.addEventListener('click', () => this.setModalAuthMode('password'));
     document.getElementById('modal-auth-tab-key')?.addEventListener('click', () => this.setModalAuthMode('key'));
+    document.getElementById('server-jump-host')?.addEventListener('change', () => this.updateRegionControls());
 
   }
 
@@ -207,6 +268,17 @@ export class ServerList {
       console.error('Failed to fetch servers:', e);
       this.servers = [];
       this.renderServerGrid();
+    }
+  }
+
+  private async fetchSharingConfig(): Promise<void> {
+    try {
+      const response = await fetch('/api/config');
+      if (!response.ok) return;
+      const config = await response.json() as { sshSharingEnabled?: boolean };
+      this.sharingEnabled = config.sshSharingEnabled === true;
+    } catch {
+      this.sharingEnabled = false;
     }
   }
 
@@ -265,7 +337,7 @@ export class ServerList {
     searchEmptyState.classList.add('hidden');
     searchEmptyState.classList.remove('flex');
 
-    const page = paginateServers(filteredServers, this.currentPage);
+    const page = paginateServers(filteredServers, this.currentPage, this.pageSize);
     this.currentPage = page.currentPage;
     const visibleServers = page.items;
 
@@ -277,8 +349,25 @@ export class ServerList {
     visibleServers.forEach((server) => {
       document.getElementById(`connect-${server.id}`)?.addEventListener('click', () => this.connectServer(server.id));
       document.getElementById(`edit-${server.id}`)?.addEventListener('click', () => this.showModal('edit', server));
+      document.getElementById(`share-${server.id}`)?.addEventListener('click', () => {
+        void this.shareManager.open(server.id, server.name);
+      });
       document.getElementById(`delete-${server.id}`)?.addEventListener('click', () => this.deleteServer(server.id));
+      const hostBadge = document.getElementById(`host-badge-${server.id}`);
+      if (hostBadge) {
+        hostBadge.addEventListener('click', async () => {
+          const ok = await copyTextToClipboard(server.host);
+          if (ok) {
+            hostBadge.classList.add('host-ip-copied');
+            setTimeout(() => hostBadge.classList.remove('host-ip-copied'), 800);
+            notify(t('server.ipCopied'), { variant: 'success', duration: 1500 });
+          } else {
+            notify(t('server.ipCopyFailed'), { variant: 'danger' });
+          }
+        });
+      }
     });
+
 
     if (page.totalPages > 1) {
       pagination?.classList.remove('hidden');
@@ -301,51 +390,83 @@ export class ServerList {
     }
   }
 
+  /** 渲染服务器名称前的图标：已识别操作系统 → 品牌 SVG，否则回退到默认 dns 图标 */
+  private renderOSIconMarkup(os: string | null | undefined): string {
+    const svg = osIconSvg(os);
+    if (svg) {
+      const label = osDisplayName(os) ?? t('os.linux');
+      return `<span class="server-os-icon shrink-0" title="${this.escapeAttr(label)}">${svg}</span>`;
+    }
+    return `<span class="material-symbols-outlined text-primary shrink-0" style="font-size: 20px; font-variation-settings: 'FILL' 0;">dns</span>`;
+  }
+
   private renderServerCard(server: ServerConfig): string {
     const authIcon = server.auth_method === 'publickey' ? 'vpn_key' : 'password';
     const authLabel = server.auth_method === 'publickey' ? 'KEY' : 'PWD';
 
-    // 区域信息：用户手动覆盖优先，其次系统推断，都没有则显示 Auto
-    const effectiveHint = server.region || server.inferred_hint || '';
+    // 下游节点自身的区域不参与调度；连接区域始终由跳板链入口决定。
+    const usesJumpHost = server.jump_server_id !== null && server.jump_server_id !== undefined;
+    const effectiveHint = usesJumpHost ? '' : (server.region || server.inferred_hint || '');
     const isManual = !!server.region;
-    const regionLabelText = regionLabel(effectiveHint);
-    const regionTag = effectiveHint
-      ? (isManual ? t('server.regionManual') : t('server.regionAuto'))
-      : t('server.regionAuto');
+    const regionLabelText = usesJumpHost ? t('server.regionViaJump') : regionLabel(effectiveHint);
+    const regionTag = usesJumpHost
+      ? t('server.regionInherited')
+      : effectiveHint
+        ? (isManual ? t('server.regionManual') : t('server.regionAuto'))
+        : t('server.regionAuto');
     const tagMarkup = (server.tags || []).length > 0
       ? `<div class="flex flex-wrap gap-1 mt-3">${server.tags.map((tag) =>
           `<span class="text-[9px] text-primary border border-[var(--border-strong)] px-1.5 py-0.5">#${this.escapeHtml(tag)}</span>`
         ).join('')}</div>`
       : '';
+    const jumpNames = this.getJumpPath(server);
+    const jumpMarkup = jumpNames.length > 0
+      ? `<div class="server-card-meta-row flex items-center gap-2 min-w-0">
+          <span class="text-dim">${t('server.jumpPath')}</span>
+          <span class="text-on-surface min-w-0 truncate" title="${this.escapeAttr(jumpNames.join(' → '))}">${jumpNames.map((name) => this.escapeHtml(name)).join(' → ')}</span>
+        </div>`
+      : '';
+
+    const maskedHost = maskIPAddress(server.host);
+    const copyIPLabel = this.escapeAttr(t('server.clickToCopyIP'));
+    const hostDisplay = maskedHost
+      ? `<button type="button" class="host-ip-badge server-host-badge min-w-0 truncate" id="host-badge-${server.id}" title="${copyIPLabel}" aria-label="${copyIPLabel}">${this.escapeHtml(maskedHost)}:${server.port}</button>`
+      : `<span class="text-on-surface min-w-0 truncate">${this.escapeHtml(server.host)}:${server.port}</span>`;
+    const shareButton = this.sharingEnabled
+      ? `<button id="share-${server.id}" class="cyber-button text-primary py-1.5 px-3 text-[10px] font-bold tracking-[0.1em] flex items-center justify-center" title="${t('share.create')}">
+          <span class="material-symbols-outlined" style="font-size:14px">share</span>
+        </button>`
+      : '';
 
     return `
       <div class="server-card p-5 relative group" id="card-${server.id}">
         <div class="absolute top-0 left-0 w-full h-[2px] bg-gradient-to-r from-transparent via-[var(--border-strong)] to-transparent group-hover:via-[var(--accent)] transition-all duration-300"></div>
-        
-        <div class="flex items-start justify-between mb-3">
-          <div class="flex items-center gap-2">
-            <span class="material-symbols-outlined text-primary" style="font-size: 20px; font-variation-settings: 'FILL' 0;">dns</span>
-            <h3 class="text-sm font-bold text-primary tracking-[0.05em]">${this.escapeHtml(server.name)}</h3>
+
+        <div class="flex items-start justify-between gap-2 mb-3">
+          <div class="flex items-center gap-2 min-w-0 flex-1">
+            ${this.renderOSIconMarkup(server.os)}
+            <h3 class="server-card-title text-sm font-bold text-primary tracking-[0.05em] truncate min-w-0" title="${this.escapeAttr(server.name)}">${this.escapeHtml(server.name)}</h3>
           </div>
-          <span class="text-[10px] font-bold tracking-[0.1em] text-muted border border-dim px-2 py-0.5 flex items-center gap-1">
+          <span class="shrink-0 text-[10px] font-bold tracking-[0.1em] text-muted border border-dim px-2 py-0.5 flex items-center gap-1">
             <span class="material-symbols-outlined" style="font-size: 12px;">${authIcon}</span>
             ${authLabel}
           </span>
         </div>
 
         <div class="space-y-1.5 text-xs text-muted mb-4">
-          <div class="flex items-center gap-2">
+          <div class="server-card-meta-row flex items-center gap-2 min-w-0">
             <span class="text-dim">${t('server.hostLabel')}</span>
-            <span class="text-on-surface">${this.escapeHtml(server.host)}:${server.port}</span>
+            ${hostDisplay}
           </div>
-          <div class="flex items-center gap-2">
+          <div class="server-card-meta-row flex items-center gap-2 min-w-0">
             <span class="text-dim">${t('server.userLabel')}</span>
-            <span class="text-on-surface">${this.escapeHtml(server.username)}</span>
+            <span class="text-on-surface min-w-0 truncate">${this.escapeHtml(server.username)}</span>
           </div>
-          <div class="flex items-center gap-2">
+          ${jumpMarkup}
+          <div class="server-card-region-row flex items-center gap-2 min-w-0">
             <span class="text-dim">${t('server.regionLabel')}</span>
             <span class="text-on-surface flex items-center gap-1">
-              <span class="material-symbols-outlined" style="font-size: 11px; color: var(--accent-secondary);">${effectiveHint ? 'my_location' : 'explore'}</span>
+              <span class="material-symbols-outlined" style="font-size: 11px; color: var(--accent-secondary);">${usesJumpHost ? 'route' : effectiveHint ? 'my_location' : 'explore'}</span>
               ${this.escapeHtml(regionLabelText)}
             </span>
             <span class="text-[9px] text-dim border border-dim px-1 py-0.5 ml-0.5">${regionTag}</span>
@@ -354,13 +475,14 @@ export class ServerList {
         </div>
 
         <div class="server-card-actions flex gap-2 pt-3 border-t border-[var(--border)]">
-          <button id="connect-${server.id}" class="cyber-button text-primary flex-1 py-1.5 px-3 text-[10px] font-bold tracking-[0.1em] uppercase flex items-center justify-center gap-1" title="${t('common.connect')}">
+          <button id="connect-${server.id}" class="server-connect-button cyber-button text-primary flex-1 min-w-0 py-1.5 px-3 text-[10px] font-bold tracking-[0.1em] uppercase flex items-center justify-center gap-1" title="${t('common.connect')}">
             <span class="material-symbols-outlined" style="font-size: 14px;">power_settings_new</span>
             ${t('common.connect')}
           </button>
           <button id="edit-${server.id}" class="cyber-button text-primary py-1.5 px-3 text-[10px] font-bold tracking-[0.1em] flex items-center justify-center" title="${t('common.edit')}">
             <span class="material-symbols-outlined" style="font-size: 14px;">edit</span>
           </button>
+          ${shareButton}
           <button id="delete-${server.id}" class="cyber-button py-1.5 px-3 text-[10px] font-bold tracking-[0.1em] flex items-center justify-center text-error border-[var(--error)] hover:bg-[var(--error)] hover:text-[var(--bg)]" title="${t('common.delete')}">
             <span class="material-symbols-outlined" style="font-size: 14px;">delete</span>
           </button>
@@ -405,6 +527,7 @@ export class ServerList {
         host: server.host,
         port: server.port,
         username: server.username,
+        serverId: server.id,
       });
     } catch (e) {
       notify(e instanceof Error ? e.message : String(e), {
@@ -443,7 +566,10 @@ export class ServerList {
         method: 'DELETE',
       });
 
-      if (!res.ok) throw new Error('Delete failed');
+      if (!res.ok) {
+        const error = await res.json().catch(() => ({})) as { error?: string };
+        throw new Error(error.error || t('server.deleteFailed', { message: res.status }));
+      }
 
       // 等待动画完成后移除
       await new Promise((r) => setTimeout(r, 300));
@@ -474,6 +600,7 @@ export class ServerList {
       <span class="material-symbols-outlined" style="font-size: 18px;">save</span>
       ${mode === 'add' ? t('server.save') : t('server.update')}
     `;
+    this.populateJumpHostSelect(server?.jump_server_id ?? null);
 
     // 填充表单
     if (mode === 'edit' && server) {
@@ -497,13 +624,9 @@ export class ServerList {
       if (regionSelect) {
         populateRegionSelect(regionSelect, server.region || '');
       }
-      // 显示系统推断值（仅编辑时，让用户了解 DB 持久化的 hint）
       if (inferredInfo) {
-        if (server.inferred_hint) {
-          inferredInfo.textContent = t('server.regionInferred', { region: regionLabel(server.inferred_hint) });
-        } else {
-          inferredInfo.textContent = '';
-        }
+        // 旧版本可能为下游节点保存过提示；该值不代表实际连接入口，不能回显。
+        inferredInfo.dataset.inferredHint = server.jump_server_id ? '' : (server.inferred_hint || '');
       }
     } else {
       // 清空表单
@@ -520,8 +643,10 @@ export class ServerList {
       const regionSelect = document.getElementById('server-region') as HTMLSelectElement | null;
       const inferredInfo = document.getElementById('server-region-inferred');
       if (regionSelect) populateRegionSelect(regionSelect, '');
-      if (inferredInfo) inferredInfo.textContent = '';
+      if (inferredInfo) inferredInfo.dataset.inferredHint = '';
     }
+
+    this.updateRegionControls();
 
     modal.classList.remove('hidden');
     modal.classList.add('flex');
@@ -555,6 +680,82 @@ export class ServerList {
     keySection.style.display = mode === 'key' ? '' : 'none';
   }
 
+  private getJumpPath(server: ServerConfig): string[] {
+    const byId = new Map(this.servers.map((item) => [item.id, item]));
+    const names: string[] = [];
+    const seen = new Set<number>([server.id]);
+    let currentId = server.jump_server_id ?? null;
+    while (currentId !== null && names.length < 3 && !seen.has(currentId)) {
+      seen.add(currentId);
+      const current = byId.get(currentId);
+      if (!current) break;
+      names.unshift(current.name);
+      currentId = current.jump_server_id ?? null;
+    }
+    return names;
+  }
+
+  private populateJumpHostSelect(selectedId: number | null): void {
+    const select = document.getElementById('server-jump-host') as HTMLSelectElement | null;
+    if (!select) return;
+    select.innerHTML = '';
+    const direct = document.createElement('option');
+    direct.value = '';
+    direct.textContent = t('server.jumpHostNone');
+    select.appendChild(direct);
+
+    const byId = new Map(this.servers.map((item) => [item.id, item]));
+    for (const candidate of this.servers) {
+      if (candidate.id === this.editingServerId) continue;
+      const seen = new Set<number>();
+      let current: ServerConfig | undefined = candidate;
+      let depth = 0;
+      let invalid = false;
+      while (current) {
+        if (seen.has(current.id) || current.id === this.editingServerId) {
+          invalid = true;
+          break;
+        }
+        seen.add(current.id);
+        depth++;
+        if (depth > 3) {
+          invalid = true;
+          break;
+        }
+        current = current.jump_server_id ? byId.get(current.jump_server_id) : undefined;
+      }
+      if (invalid) continue;
+      const option = document.createElement('option');
+      option.value = String(candidate.id);
+      option.textContent = candidate.name;
+      select.appendChild(option);
+    }
+    select.value = selectedId ? String(selectedId) : '';
+  }
+
+  private updateRegionControls(): void {
+    const jumpSelect = document.getElementById('server-jump-host') as HTMLSelectElement | null;
+    const regionSelect = document.getElementById('server-region') as HTMLSelectElement | null;
+    const inferredInfo = document.getElementById('server-region-inferred');
+    if (!jumpSelect || !regionSelect || !inferredInfo) return;
+
+    const usesJumpHost = jumpSelect.value !== '';
+    regionSelect.disabled = usesJumpHost;
+    regionSelect.classList.toggle('cursor-not-allowed', usesJumpHost);
+    regionSelect.classList.toggle('opacity-60', usesJumpHost);
+    if (usesJumpHost) {
+      // 下游节点没有独立的连接区域；切回直连时从 Auto 重新开始。
+      regionSelect.value = '';
+      inferredInfo.textContent = t('server.regionViaJumpHint');
+      return;
+    }
+
+    const inferredHint = inferredInfo.dataset.inferredHint || '';
+    inferredInfo.textContent = inferredHint
+      ? t('server.regionInferred', { region: regionLabel(inferredHint) })
+      : '';
+  }
+
   private async handleSubmit(): Promise<void> {
     const name = (document.getElementById('server-name') as HTMLInputElement).value.trim();
     const host = (document.getElementById('server-host') as HTMLInputElement).value.trim();
@@ -564,6 +765,8 @@ export class ServerList {
     const password = (document.getElementById('server-password') as HTMLInputElement).value;
     const privateKey = (document.getElementById('server-private-key') as HTMLTextAreaElement).value;
     const tags = normalizeTagsInput((document.getElementById('server-tags') as HTMLInputElement).value);
+    const jumpValue = (document.getElementById('server-jump-host') as HTMLSelectElement | null)?.value || '';
+    const jumpServerId = jumpValue ? Number(jumpValue) : null;
 
     if (!name || !host || !username) {
       notify(t('server.detailsRequired'), {
@@ -611,12 +814,20 @@ export class ServerList {
     `;
 
     try {
-      const body: any = { name, host, port, username, auth_method: authMethod, tags };
+      const body: ServerSavePayload = {
+        name,
+        host,
+        port,
+        username,
+        auth_method: authMethod,
+        tags,
+        jump_server_id: jumpServerId,
+      };
       if (credential) body.credential = credential;
 
-      // 区域偏好：空字符串表示 Auto（让系统自动推断）
+      // 只有 Cloudflare 直连入口才提交区域偏好；下游节点由跳板链入口决定。
       const regionSelect = document.getElementById('server-region') as HTMLSelectElement | null;
-      if (regionSelect) {
+      if (regionSelect && jumpServerId === null) {
         body.region = regionSelect.value || '';
       }
 
@@ -641,30 +852,37 @@ export class ServerList {
         throw new Error(err.error || 'Save failed');
       }
 
-      const responseData = await res.json() as any;
+      const responseData = await res.json() as ServerSaveResponse;
+      const debugLines = Array.isArray(responseData._debug)
+        ? responseData._debug.filter((line): line is string => typeof line === 'string')
+        : null;
 
       // DEBUG_MODE 时，响应中包含 _debug 字段：显示完整调试日志
-      if (responseData._debug && Array.isArray(responseData._debug)) {
+      if (debugLines) {
         console.log('[locationHint 调试信息]');
-        responseData._debug.forEach((msg: string) => console.log(msg));
-        this.showDebugNotification(responseData._debug);
+        debugLines.forEach((msg) => console.log(msg));
+        this.showDebugNotification(debugLines);
       }
 
       // 非调试模式：用简短 toast 提示推断结果，让用户知道区域调度已生效
       // POST 与 PUT 路径后端均会返回最新记录（含 inferred_hint 字段）
-      if (!responseData._debug) {
-        const inferred = responseData.inferred_hint || null;
-        const userRegion = body.region || null;
-        if (userRegion || inferred) {
-          // 用户手动指定优先显示手动值，否则显示系统推断值
-          const hint = userRegion || inferred;
-          notify(t('server.savedRegion', { region: regionLabel(hint) }), { variant: 'success' });
+      if (!debugLines) {
+        if (jumpServerId !== null) {
+          notify(t('server.savedViaJump'), { variant: 'success' });
         } else {
-          // 推断失败（私网 IP / 限流 / 未命中映射表）
-          notify(t('server.savedAuto'), {
-            title: t('feedback.success'),
-            variant: 'warning',
-          });
+          const inferred = responseData.inferred_hint || null;
+          const userRegion = body.region || null;
+          if (userRegion || inferred) {
+            // 用户手动指定优先显示手动值，否则显示系统推断值
+            const hint = userRegion || inferred;
+            notify(t('server.savedRegion', { region: regionLabel(hint) }), { variant: 'success' });
+          } else {
+            // 推断失败（私网 IP / 限流 / 未命中映射表）
+            notify(t('server.savedAuto'), {
+              title: t('feedback.success'),
+              variant: 'warning',
+            });
+          }
         }
       }
 
@@ -738,5 +956,9 @@ export class ServerList {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+  }
+
+  private escapeAttr(text: string): string {
+    return text.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 }

@@ -3,6 +3,9 @@ import { SFTPPanel } from './sftp-panel';
 import { AgentPanel } from './agent/agent-panel';
 import { t } from './i18n';
 import { getNetworkQuality } from './network-quality';
+import { copyTextToClipboard } from './clipboard';
+import { notify } from './ui-feedback';
+import { maskIPAddress } from './host-display';
 
 export type TabState = 'connecting' | 'connected' | 'disconnected';
 
@@ -39,6 +42,9 @@ export class TabManager {
   /** 当所有标签都被关闭时触发，外部可以用它来回到连接页面 */
   private onAllTabsClosed?: () => void;
 
+  /** 连接后检测到远端操作系统时触发（用于更新服务器列表图标） */
+  private onOSDetected?: (serverId: number, os: string) => void;
+
   constructor(tabBarId: string, terminalAreaId: string) {
     this.tabBarEl = document.getElementById(tabBarId)!;
     this.terminalAreaEl = document.getElementById(terminalAreaId)!;
@@ -51,6 +57,10 @@ export class TabManager {
 
   setAllTabsClosedHandler(handler: () => void): void {
     this.onAllTabsClosed = handler;
+  }
+
+  setOSDetectedHandler(handler: (serverId: number, os: string) => void): void {
+    this.onOSDetected = handler;
   }
 
   // ==================== 创建标签 ====================
@@ -75,10 +85,10 @@ export class TabManager {
     const terminal = new SSHTerminal(terminalInner.id);
 
     // 设置会话关闭回调
-    terminal.setSessionClosedHandler(() => {
+    terminal.setSessionClosedHandler((_event, willReconnect) => {
       const tab = this.tabs.get(id);
       if (tab) {
-        tab.state = 'disconnected';
+        tab.state = willReconnect ? 'connecting' : 'disconnected';
         this.renderTabBar();
         if (this.activeTabId === id) {
           this.updateStatusBar(tab);
@@ -143,6 +153,11 @@ export class TabManager {
       }
     });
 
+    // 连接后检测到远端操作系统 → 通知外部更新服务器列表图标
+    terminal.setOSDetectedHandler((serverId, os) => {
+      this.onOSDetected?.(serverId, os);
+    });
+
     // 设置延迟监测更新回调
     terminal.setLatencyUpdatedHandler((cfLatency, cfColo, wsLatency) => {
       const t = this.tabs.get(id);
@@ -204,6 +219,7 @@ export class TabManager {
     // 显示目标标签
     tab.containerEl.style.display = 'flex';
     this.activeTabId = tabId;
+    document.dispatchEvent(new Event('cloudssh:active-terminal-change'));
 
     // Mount 并 fit 终端
     tab.terminal.mount();
@@ -407,7 +423,28 @@ export class TabManager {
     const statusText = document.getElementById('status-text');
 
     if (tab.hostInfo) {
-      if (termHost) termHost.textContent = t('terminal.host', { value: tab.hostInfo.host });
+      if (termHost) {
+        const masked = maskIPAddress(tab.hostInfo.host);
+        if (masked) {
+          const copyIPLabel = this.escapeAttr(t('terminal.clickToCopyIP'));
+          termHost.innerHTML = `${t('terminal.hostLabel')}<button type="button" class="host-ip-badge" title="${copyIPLabel}" aria-label="${copyIPLabel}">${this.escapeHtml(masked)}</button>`;
+          const badge = termHost.querySelector('.host-ip-badge') as HTMLButtonElement | null;
+          if (badge) {
+            badge.addEventListener('click', async () => {
+              const ok = await copyTextToClipboard(tab.hostInfo!.host);
+              if (ok) {
+                badge.classList.add('host-ip-copied');
+                setTimeout(() => badge.classList.remove('host-ip-copied'), 800);
+                notify(t('terminal.ipCopied'), { variant: 'success', duration: 1500 });
+              } else {
+                notify(t('terminal.ipCopyFailed'), { variant: 'danger' });
+              }
+            });
+          }
+        } else {
+          termHost.textContent = t('terminal.host', { value: tab.hostInfo.host });
+        }
+      }
       if (termUser) termUser.textContent = tab.hostInfo.username ? t('terminal.user', { value: tab.hostInfo.username }) : '';
       if (termPort) termPort.textContent = t('terminal.port', { value: tab.hostInfo.port });
     } else {
@@ -493,5 +530,9 @@ export class TabManager {
     const div = document.createElement('div');
     div.textContent = text;
     return div.innerHTML;
+  }
+
+  private escapeAttr(text: string): string {
+    return text.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 }

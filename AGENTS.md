@@ -27,10 +27,13 @@ src/
 ├── worker/           # Cloudflare Worker entry and Durable Objects
 │   ├── index.ts      # Main worker entry (request routing, bounded in-memory SSH rate limiting)
 │   ├── durable-object.ts  # SSHSessionDO - manages SSH sessions
+│   ├── share-do.ts    # SSHShareDO - one-time capability lifecycle and share-only audit log
 │   ├── ssh-session.ts     # SSH session logic, multi-channel routing, SFTP handling
+│   ├── direct-tcpip-stream.ts # RFC 4254 direct-tcpip 背压字节流，用于嵌套 SSH 跳板链
 │   ├── sftp-handler.ts    # SFTP protocol ops, task queue, concurrent download, upload tracking
-│   ├── user-db.ts    # UserDBDO - user/server storage（含单层标签持久化）
+│   ├── user-db.ts    # UserDBDO - user/server storage（含标签、OS 与跳板关系持久化）
 │   ├── server-tags.ts # 服务器标签规范化与 SQLite JSON 序列化
+│   ├── os-detect.ts  # 远端操作系统输出解析、规范 key 与持久化白名单
 │   ├── auth.ts       # GitHub OAuth handling
 │   ├── agent/        # AI Agent system
 │   │   ├── core.ts       # Agent control loop (LLM calls, tool execution)
@@ -50,8 +53,8 @@ src/
 │   ├── kex-curve25519.ts  # Curve25519-SHA256 key exchange
 │   ├── kex-ecdh.ts   # ECDH-NISTP256 key exchange
 │   ├── algorithms.ts # Supported algorithm definitions
-│   ├── auth.ts       # Authentication methods (password, Ed25519/ECDSA/RSA private keys)
-│   ├── channel.ts    # SSH channels (session + SFTP subsystem + exec)
+│   ├── auth.ts       # Authentication methods (password, RFC 4256 keyboard-interactive, Ed25519/ECDSA/RSA private keys)
+│   ├── channel.ts    # SSH channels (session + direct-tcpip + SFTP subsystem + exec)
 │   ├── crypto.ts     # AES-GCM/CTR cipher, HMAC implementations
 │   ├── keys.ts       # Key derivation per RFC 4253
 │   ├── utils.ts      # Binary utilities
@@ -64,11 +67,17 @@ frontend/
 ├── src/
 │   ├── main.ts       # Frontend entry point (routing, theme, event handlers)
 │   ├── terminal.ts   # xterm.js terminal setup (search, dynamic RTT latency, log export)
+│   ├── auth-challenge-dialog.ts # RFC 4256 multi-round authentication prompt UI
+│   ├── mobile-terminal.ts # Mobile viewport, shortcut toolbar, clipboard and landscape controller
+│   ├── mobile-input.ts # Pure iOS IME diff and one-shot modifier helpers
+│   ├── known-hosts.ts # 已验证主机指纹消息校验、本地/云端 TOFU 持久化
 │   ├── tab-manager.ts # Tab manager (multi-session terminal/SFTP/Agent coordinator)
 │   ├── sftp-panel.ts # SFTP file manager UI (multi-select, batch actions, queue, cancel)
 │   ├── sftp-selection.ts # Pure multi-selection state model
 │   ├── auth-form.ts  # Auth form & encrypted anonymous credentials storage/autofill
 │   ├── server-list.ts # Server UI (tags, search, 9-card pagination, CRUD/connect)
+│   ├── share-manager.ts # Owner UI for creating, revoking, and auditing one-time shares
+│   ├── share-session.ts # Public one-time share landing and claim flow
 │   ├── agent/
 │   │   ├── agent-panel.ts  # AI assistant sidebar (context attachments, streaming, Markdown, confirmations)
 │   │   └── terminal-selection-context.ts # Selection snapshots and untrusted-data prompt boundary
@@ -125,7 +134,7 @@ The frontend is **NOT** served separately in production. The build process:
 
 ## Durable Objects
 
-Two Durable Objects handle state:
+Three Durable Objects handle state:
 
 1. **SSHSessionDO** (`src/worker/durable-object.ts`)
    - Manages WebSocket ↔ TCP socket connections
@@ -136,11 +145,18 @@ Two Durable Objects handle state:
    - SQLite-based user and server storage
    - GitHub OAuth user management
 
+3. **SSHShareDO** (`src/worker/share-do.ts`)
+   - Owns one random capability's one-time claim, short-lived connection ticket, expiry, and revocation state
+   - Stores the append-only lifecycle, SFTP, and terminal-output audit log for that share session
+
 ## Environment Variables
 
 Required for optional features (configured in `wrangler.toml` or Cloudflare Dashboard):
 
 - `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` - GitHub OAuth
+- `GITHUB_ALLOWED_USER_IDS` - Optional comma-separated numeric GitHub user ID allowlist; omitted means unrestricted GitHub login
+- `REQUIRE_GITHUB_AUTH` - Optional; `true` disables anonymous SSH and requires a valid GitHub session
+- `ENABLE_SSH_SHARING` - Optional; `true` enables one-time audited SSH sharing for signed-in owners (disabled by default)
 - `TURNSTILE_SECRET` / `TURNSTILE_SITEKEY` - Bot verification
 - `BASE_URL` - OAuth callback URL
 
@@ -152,9 +168,13 @@ Required for optional features (configured in `wrangler.toml` or Cloudflare Dash
 | `/api/auth/callback` | GET | No | OAuth callback, creates user + session |
 | `/api/auth/logout` | POST | No | Logout, clears session |
 | `/api/auth/me` | GET | Yes | Returns current user info |
-| `/api/servers` | GET/POST | Yes | List or create saved servers（含单层 `tags`） |
-| `/api/servers/:id` | PUT/DELETE | Yes | Update or delete a server（含标签更新） |
+| `/api/servers` | GET/POST | Yes | List or create saved servers（含 `tags` 与可选 `jump_server_id`） |
+| `/api/servers/:id` | PUT/DELETE | Yes | Update or delete a server（含标签和跳板关系校验） |
 | `/api/servers/:id/connect` | POST | Yes | Generate one-time-token, return WebSocket URL |
+| `/api/servers/:id/shares` | GET/POST | Yes | List or create one-time SSH shares for a saved server |
+| `/api/shares/:id` | DELETE | Yes | Revoke a share owned by the current user |
+| `/api/shares/:id/audit` | GET | Yes | Read the paginated audit log for an owned share |
+| `/api/share/claim` | POST | No | Atomically claim a capability token and return a short-lived WebSocket ticket |
 | `/api/user/theme` | GET/PUT | Yes | Get or replace the signed-in user's single custom theme |
 | `/api/known-hosts` | GET/POST/DELETE | Yes | Known host fingerprint CRUD (TOFU) |
 | `/api/ai/config` | GET/PUT | Yes | Get or save AI LLM config |
@@ -221,7 +241,7 @@ ci: CI/CD 变更
 4. **Local dev proxy** - Frontend dev server proxies `/api` to `localhost:8787` (wrangler)
 5. **TypeScript config** - Root `tsconfig.json` excludes `frontend/` (has its own config)
 6. **AI Agent runs in DO** - The agent control loop (`agent/core.ts`) executes inside the Durable Object, not the Worker itself, to access the SSH session directly
-7. **Agent tool confirmations** - Dangerous commands (rm -rf, shutdown, etc.) require user confirmation via `agent_confirm` WebSocket message before execution. Blocked commands (rm -rf /, fork bomb, etc.) are rejected outright without prompting.
+7. **Agent tool confirmations** - Dangerous commands (rm -rf, shutdown, etc.) require user confirmation via `agent_confirm` WebSocket message before execution. Blocked commands (rm -rf /, fork bomb, etc.) are rejected outright without prompting. Preserve detection across shell control boundaries (`;`, `&&`, `||`, pipes, parentheses, and newlines), including combinations without surrounding spaces.
 8. **Agent loop timeouts & Watchdog** - The agent run loop has a step-based timeout of 60 seconds (managed by a watchdog timer in `agent/core.ts` that resets after each LLM response or tool execution). When waiting for user confirmation via `agent_confirm`, the watchdog timer is paused to prevent timeouts due to user delays.
 9. **SSH rate limiting** - `/api/ssh` uses a bounded, Worker-isolate in-memory limiter for traffic shedding. It skips requests without `CF-Connecting-IP`; Turnstile and one-time tokens remain the connection authorization controls.
 10. **Tailwind is built locally** - `frontend/postcss.config.cjs` and `frontend/tailwind.config.cjs` generate Tailwind CSS during Vite builds. Do not reintroduce `cdn.tailwindcss.com`; keep content scan paths and theme variable mappings synchronized when adding frontend source locations or theme tokens.
@@ -229,8 +249,16 @@ ci: CI/CD 变更
 12. **Server list organization** - server tags are stored as normalized JSON in SQLite, filtered client-side, and rendered with 9 items per page. Search/tag changes must reset pagination to page 1.
 13. **SFTP selection model** - file selection supports single, Cmd/Ctrl toggle, Shift range and select-all. Batch download reuses the sequential download queue; batch delete waits for all delete/rmdir results before refreshing.
 14. **Agent terminal selection context** - “Ask AI assistant” attaches one immutable selection snapshot per tab and never sends it by itself. New selections replace the pending snapshot; successful sends and session teardown clear it. Preserve the untrusted-data/non-authorization boundary in `terminal-selection-context.ts`.
-15. **Region inference privacy** - Saving or changing a server host calls the third-party IPinfo service and persists the inferred locationHint. Keep the provider name and disclosure synchronized across README/code comments; failures must continue to fall back to Cloudflare's default placement.
+15. **Region inference privacy** - Saving or changing a Cloudflare-direct server host calls the third-party IPinfo service and persists the inferred locationHint. Servers with `jump_server_id` are downstream nodes: never query their hosts, ignore and clear their own region hints, and infer once if they later become direct Auto entries. Keep the provider name and disclosure synchronized across README/code comments; failures must continue to fall back to Cloudflare's default placement.
 16. **Theme editor ownership** - The full visual editor and JSON export live in `docs/theme-editor/index.html` for GitHub Pages and never authenticate against CloudSSH. `scripts/sync-theme-editor.js` keeps its built-in colors and resolved appearance presets aligned with `frontend/src/theme.ts`; the application and Worker share Theme V2 validation through `src/theme-schema.ts`. The application only imports JSON themes and synchronizes the single custom-theme slot through `/api/user/theme` for signed-in users; later imports replace the previous theme, while anonymous themes remain local.
+17. **Mobile terminal input and recovery** - Mobile shortcuts and the iOS keyCode 229 fallback must continue through `TrzszFilter.processTerminalInput`; never send them directly to the WebSocket, and do not permit any terminal input until `shell_ready`. For iOS IME fallback, capture the textarea baseline on `keydown=229` but flush on the corresponding `keyup` regardless of its key code, since Safari commonly reports 32 for Space and 0 for punctuation; xterm `onData` remains authoritative to prevent duplicate input. Keep the explicit mobile selection mode isolated from desktop mouse auto-copy, map touch drags through xterm's public selection API instead of native long-press selection, and debounce visual viewport refits. Enable background-return visibility recovery only when the device has touch points and a coarse primary pointer, so desktop tab changes do not emit recovery logs or probes. A mobile background return must validate the WebSocket with a bounded ID-matched heartbeat instead of trusting `readyState`; anonymous reconnects may reuse only the current in-memory config, while saved-server reconnects must request a fresh one-time token from `/api/servers/:id/connect`. Never report a connection as online before the replacement Shell is ready.
+18. **Saved-server OS detection** - Run OS detection only for signed-in saved servers without a persisted result, through a separate non-blocking SSH exec channel after Shell readiness. Never persist `unknown`; host or port changes must clear the stored OS, and background metadata updates must not change `updated_at` or server ordering. Keep backend canonical keys synchronized with frontend labels/icon fallbacks.
+19. **Keyboard-interactive authentication** - Begin user authentication with the RFC 4252 `none` probe and choose only methods advertised by the server, while retaining the bounded compatibility fallback for servers that omit the list. RFC 4256 challenges are event-driven during the SSH auth state. Keep method-specific message type 60 disambiguated by the active auth method, use `partial_success` to advance bounded multi-factor stages, and only fall back without partial success when the server no longer offers the configured primary method. Bind browser responses and `auth_challenge_ack` display acknowledgements to one random challenge ID and originating WebSocket, distinguish an undisplayed challenge from an acknowledged but unanswered challenge, never log responses, clear pending challenges on timeout/reconnect/close, require explicit user action before substituting a stored password, and close authentication timeouts normally so older frontends cannot reconnect repeatedly. Treat ordinary server-side credential rejection as an expected close rather than WebSocket error 1011.
+20. **WebSocket origin boundary** - `/api/ssh` (anonymous and one-time-token paths) and `/api/ssh/sftp` are browser-only, same-origin endpoints. Reject WebSocket upgrades when `Origin` is missing or differs from the request URL origin, and keep regression coverage synchronized across all three paths.
+21. **GitHub access policy** - `GITHUB_ALLOWED_USER_IDS` contains stable numeric GitHub IDs and is rechecked during OAuth callback and every session verification; omitted means unrestricted, while an empty or malformed configured value fails closed. `REQUIRE_GITHUB_AUTH=true` disables anonymous SSH and requires a valid session for direct and one-time-token SSH upgrades, but does not terminate already established WebSockets. Never expose the allowlist through `/api/config`.
+22. **SSH jump chains** - Jump hosts are available only to signed-in users through saved-server `jump_server_id` relations. Resolve one immutable outer-to-target chain in UserDBDO, reject cross-user references, cycles, deletion of referenced hops, and more than 3 jump hosts. Apply public-address SSRF checks only to the outermost Cloudflare TCP destination; anonymous clients must never inject `jumpHosts`. Every intermediate SSHSession authenticates without opening a Shell and exposes only RFC 4254 `direct-tcpip`; terminal, SFTP, Agent exec, and OS detection belong to the final session. Preserve nested channel backpressure, close the full chain on any-hop failure, and scope known-host identities by the complete route so equal private addresses behind different bastions do not collide.
+23. **SSH host-key TOFU** - Never publish or persist a first-seen/replacement fingerprint before its KEX host-key signature succeeds. A changed fingerprint must close normally without automatic retry, display the old/new values for explicit user confirmation, and replace only the exact route-scoped identity. Saved-server confirmation must update the cloud record before requesting a fresh one-time token; anonymous confirmation may update only the current in-memory config and local record. Cancellation or persistence failure must leave the previous trust record intact.
+24. **One-time SSH sharing** - Sharing is disabled unless `ENABLE_SSH_SHARING=true`. A link contains only a 256-bit capability, persists only its hash, can be claimed once, and exchanges for a one-minute connection ticket. Creation requires route-scoped verified host fingerprints for the target and every jump hop. Share policy is issued only by SSHShareDO/UserDBDO and must disable Agent, OS detection, host-key mutation, metadata mutation, keyboard-interactive auth, and reconnect while permitting only Terminal and optional SFTP. Record lifecycle, structured SFTP requests/results, and terminal output (not raw keystrokes); stop the session if audit storage fails or reaches 5 MiB/5000 events. Revocation and expiry must close the live SSHSessionDO. Preserve completed audit metadata if its saved-server record is later deleted.
 
 ## Deployment Notes
 
@@ -243,7 +271,7 @@ ci: CI/CD 变更
 | Production | `cloudssh` | `main` | `<name>.workers.dev` + 自定义域名 |
 | Test | `cloudssh-test` | `test` | `<name>-test.workers.dev` + 自定义域名 |
 
-两个环境的 Durable Objects（SSHSessionDO、UserDBDO）数据完全隔离。
+两个环境的 Durable Objects（SSHSessionDO、UserDBDO、SSHShareDO）数据完全隔离。
 
 ### 部署方式
 
@@ -275,6 +303,9 @@ pnpm run deploy:test     # 部署 test 环境
 
 通过 Cloudflare Dashboard 或 wrangler CLI 设置：
 - `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET` - GitHub OAuth
+- `GITHUB_ALLOWED_USER_IDS` - 可选，逗号分隔的 GitHub 数字用户 ID 白名单
+- `REQUIRE_GITHUB_AUTH` - 可选，设为 `true` 时禁用匿名 SSH 并要求有效 GitHub session
+- `ENABLE_SSH_SHARING` - 可选，设为 `true` 时允许登录用户创建一次性、受审计的 SSH 分享（默认关闭）
 - `TURNSTILE_SECRET` / `TURNSTILE_SITEKEY` - Bot 验证
 - `BASE_URL` - OAuth 回调地址（需与实际域名一致）
 

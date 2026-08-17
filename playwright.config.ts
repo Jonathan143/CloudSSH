@@ -17,6 +17,11 @@ export default defineConfig({
       name: 'chromium',
       use: { ...devices['Desktop Chrome'] },
     },
+    {
+      name: 'webkit-mobile',
+      testMatch: /(?:auth-challenge|connection-recovery|ios-ime)\.spec\.ts/,
+      use: { ...devices['iPhone 13'] },
+    },
   ],
   webServer: {
     command: 'pnpm --dir frontend exec vite --host 127.0.0.1 --port 4173',

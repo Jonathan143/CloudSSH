@@ -5,13 +5,20 @@ import {
   normalizeImportedTheme,
   THEME_MAX_BYTES,
 } from './theme';
-import type { SSHTerminal } from './terminal';
+import type { SSHHostInfo, SSHTerminal } from './terminal';
 import { ConnectionForm } from './auth-form';
 import { ServerList } from './server-list';
 import { TabManager } from './tab-manager';
 import { AIConfigPanel } from './ai-config';
 import { notify } from './ui-feedback';
 import { initI18n, onLocaleChange, t } from './i18n';
+import { MobileTerminalController } from './mobile-terminal';
+import {
+  renderShareEnded,
+  renderShareLanding,
+  takeShareTokenFromLocation,
+  type ClaimedShare,
+} from './share-session';
 
 // ==================== 全局状态 ====================
 
@@ -19,6 +26,44 @@ let tabManager: TabManager | null = null;
 let connectionForm: ConnectionForm | null = null;
 let serverList: ServerList | null = null;
 let isLoggedIn = false;
+let sharedSessionMode = false;
+const mobileTerminalController = new MobileTerminalController(
+  () => tabManager?.getActiveTab()?.terminal ?? null,
+);
+
+function setUserSpaceMenuOpen(open: boolean): void {
+  document.getElementById('user-space-header-actions')?.classList.toggle('is-open', open);
+  document.getElementById('user-space-more-btn')?.setAttribute('aria-expanded', String(open));
+}
+
+function initUserSpaceMobileMenu(): void {
+  const button = document.getElementById('user-space-more-btn');
+  const menu = document.getElementById('user-space-header-actions');
+  if (!button || !menu) return;
+
+  button.addEventListener('click', () => {
+    setUserSpaceMenuOpen(!menu.classList.contains('is-open'));
+  });
+  menu.addEventListener('click', (event) => {
+    if ((event.target as HTMLElement).closest('button')) setUserSpaceMenuOpen(false);
+  });
+  menu.addEventListener('change', () => setUserSpaceMenuOpen(false));
+  document.addEventListener('pointerdown', (event) => {
+    const target = event.target as Node | null;
+    if (target && (button.contains(target) || menu.contains(target))) return;
+    setUserSpaceMenuOpen(false);
+  }, true);
+}
+
+function initServerPaginationBreakpoints(): void {
+  const queries = [
+    window.matchMedia('(max-width: 767px)'),
+    window.matchMedia('(max-width: 1180px) and (pointer: coarse)'),
+  ];
+  queries.forEach((query) => {
+    query.addEventListener('change', () => serverList?.refreshPageSize());
+  });
+}
 
 /** 获取或初始化 TabManager 单例 */
 function getTabManager(): TabManager {
@@ -28,6 +73,10 @@ function getTabManager(): TabManager {
       showOfflineUI();
     });
     tabManager.setLoggedIn(isLoggedIn);
+    // 连接后检测到操作系统 → 即时更新服务器列表卡片图标
+    tabManager.setOSDetectedHandler((serverId, os) => {
+      serverList?.updateServerOS(serverId, os);
+    });
 
     // 绑定 new-tab-btn
     bindNewTabButton();
@@ -98,13 +147,18 @@ function initTerminalTab(): void {
 
 // ==================== 页面切换 ====================
 
-function showAuthSection(): void {
-  document.getElementById('auth-section')!.classList.remove('hidden');
-  document.getElementById('user-space-section')!.classList.add('hidden');
-  document.getElementById('user-space-section')!.classList.remove('flex');
+function deactivateTerminalView(): void {
+  mobileTerminalController.leaveTerminal();
   document.getElementById('terminal-section')!.classList.add('hidden');
   document.getElementById('terminal-section')!.classList.remove('flex');
   document.body.classList.remove('terminal-active');
+}
+
+function showAuthSection(): void {
+  deactivateTerminalView();
+  document.getElementById('auth-section')!.classList.remove('hidden');
+  document.getElementById('user-space-section')!.classList.add('hidden');
+  document.getElementById('user-space-section')!.classList.remove('flex');
   document.getElementById('server-modal')!.classList.add('hidden');
   document.getElementById('server-modal')!.classList.remove('flex');
 
@@ -116,13 +170,11 @@ function showAuthSection(): void {
 }
 
 function showUserSpace(user: { id: number; github_id: number; username: string; avatar_url: string }): void {
+  deactivateTerminalView();
   isLoggedIn = true;
   document.getElementById('auth-section')!.classList.add('hidden');
   document.getElementById('user-space-section')!.classList.remove('hidden');
   document.getElementById('user-space-section')!.classList.add('flex');
-  document.getElementById('terminal-section')!.classList.add('hidden');
-  document.getElementById('terminal-section')!.classList.remove('flex');
-  document.body.classList.remove('terminal-active');
 
   // Show agent toggle button for logged-in users
   document.getElementById('agent-toggle-btn')?.classList.remove('hidden');
@@ -139,7 +191,7 @@ function showUserSpace(user: { id: number; github_id: number; username: string; 
       showAuthSection();
     },
     // onConnect 回调 — 在当前页面创建新标签
-    (wsUrl: string, serverName: string, hostInfo?: { host: string; port: number; username?: string }) => {
+    (wsUrl: string, serverName: string, hostInfo?: SSHHostInfo) => {
       showTerminalFromServer(wsUrl, serverName, hostInfo);
     }
   );
@@ -152,21 +204,22 @@ function showConnectionPage(): void {
   // 如果还有活跃标签，不需要隐藏终端区域；只需要覆盖显示连接页面
   // 但为了简单起见，我们先切回对应的入口页面
   if (isLoggedIn) {
-    document.getElementById('terminal-section')!.classList.add('hidden');
-    document.getElementById('terminal-section')!.classList.remove('flex');
-    document.body.classList.remove('terminal-active');
+    deactivateTerminalView();
     document.getElementById('user-space-section')!.classList.remove('hidden');
     document.getElementById('user-space-section')!.classList.add('flex');
   } else {
-    document.getElementById('terminal-section')!.classList.add('hidden');
-    document.getElementById('terminal-section')!.classList.remove('flex');
-    document.body.classList.remove('terminal-active');
     showAuthSection();
   }
 }
 
 function showOfflineUI(): void {
+  if (sharedSessionMode) {
+    deactivateTerminalView();
+    renderShareEnded();
+    return;
+  }
   if (isTerminalTab()) {
+    mobileTerminalController.leaveTerminal();
     window.close();
     return;
   }
@@ -176,12 +229,7 @@ function showOfflineUI(): void {
     return;
   }
 
-  const termSection = document.getElementById('terminal-section');
-  if (termSection) {
-    termSection.classList.add('hidden');
-    termSection.classList.remove('flex');
-    document.body.classList.remove('terminal-active');
-  }
+  deactivateTerminalView();
 
   if (isLoggedIn) {
     document.getElementById('user-space-section')?.classList.remove('hidden');
@@ -197,7 +245,7 @@ function showOfflineUI(): void {
 function showTerminalWithNewTab(
   label: string,
   displayLabel: string,
-  hostInfo?: { host: string; port: number; username?: string }
+  hostInfo?: SSHHostInfo,
 ): { tab: ReturnType<TabManager['createTab']>; terminal: SSHTerminal } {
   document.getElementById('auth-section')!.classList.add('hidden');
   document.getElementById('user-space-section')!.classList.add('hidden');
@@ -215,7 +263,7 @@ function showTerminalWithNewTab(
 function showTerminalFromServer(
   wsUrl: string,
   serverName: string,
-  hostInfo?: { host: string; port: number; username?: string },
+  hostInfo?: SSHHostInfo,
 ): void {
   if (!validateWsUrl(wsUrl)) {
     notify(t('server.invalidWs'), {
@@ -236,7 +284,47 @@ function showTerminalFromServer(
   // 通过 wsUrl（含 one-time-token）建立连接
   const ws = new WebSocket(wsUrl);
   ws.binaryType = 'arraybuffer';
-  terminal.connectWithWebSocket(ws, hostInfo);
+  const serverId = hostInfo?.serverId;
+  const reconnectFactory = serverId
+    ? () => requestSavedServerWebSocket(serverId)
+    : undefined;
+  terminal.connectWithWebSocket(ws, hostInfo, { reconnectFactory });
+}
+
+function showSharedTerminal(claim: ClaimedShare): void {
+  if (!validateWsUrl(claim.wsUrl)) {
+    renderShareEnded();
+    return;
+  }
+  sharedSessionMode = true;
+  isLoggedIn = false;
+  document.getElementById('agent-toggle-btn')?.classList.add('hidden');
+  const tabBar = document.getElementById('tab-bar');
+  if (tabBar) tabBar.style.display = 'none';
+  const { terminal } = showTerminalWithNewTab(claim.serverName, claim.serverName);
+  terminal.mount();
+  const socket = new WebSocket(claim.wsUrl);
+  socket.binaryType = 'arraybuffer';
+  terminal.connectWithWebSocket(socket);
+}
+
+async function requestSavedServerWebSocket(serverId: number): Promise<WebSocket> {
+  const response = await fetch(`/api/servers/${serverId}/connect`, { method: 'POST' });
+  if (!response.ok) {
+    const contentType = response.headers.get('content-type') || '';
+    const message = contentType.includes('application/json')
+      ? (await response.json() as { error?: string }).error
+      : null;
+    throw new Error(message || `Connection failed (${response.status})`);
+  }
+
+  const { wsUrl } = await response.json() as { wsUrl?: unknown };
+  if (typeof wsUrl !== 'string' || !validateWsUrl(wsUrl)) {
+    throw new Error(t('server.invalidWs'));
+  }
+  const socket = new WebSocket(wsUrl);
+  socket.binaryType = 'arraybuffer';
+  return socket;
 }
 
 // ==================== 断开连接处理 ====================
@@ -484,6 +572,9 @@ async function restoreCloudTheme(
 
 async function init(): Promise<void> {
   initI18n();
+  initUserSpaceMobileMenu();
+  initServerPaginationBreakpoints();
+  mobileTerminalController.start();
   onLocaleChange(() => {
     if (localStorage.getItem('cloudssh_imported_theme')) ensureCustomOption();
     tabManager?.refreshTranslations();
@@ -494,6 +585,12 @@ async function init(): Promise<void> {
   const copyrightYearSpan = document.getElementById('copyright-year');
   if (copyrightYearSpan) {
     copyrightYearSpan.textContent = new Date().getFullYear().toString();
+  }
+
+  const shareToken = takeShareTokenFromLocation();
+  if (shareToken) {
+    renderShareLanding(shareToken, showSharedTerminal);
+    return;
   }
 
   // 独立终端标签页模式：URL 包含 wsUrl 参数

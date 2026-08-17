@@ -37,6 +37,8 @@ export interface ECDHResult {
 export interface AuthResult {
   success: boolean;
   allowedMethods?: string[];
+  /** RFC 4252: whether a previous authentication step partially succeeded. */
+  partialSuccess?: boolean;
 }
 
 export interface SSHConnectionConfig {
@@ -49,8 +51,14 @@ export interface SSHConnectionConfig {
   cols?: number;
   rows?: number;
   expectedFingerprint?: string;
+  /** Path-scoped known-host identity; defaults to host for direct connections. */
+  knownHostIdentity?: string;
   userId?: string;
   githubId?: string;
+  /** 已保存服务器的记录 ID（token 路径下由 handleConnectServer 填充，供 OS 检测持久化） */
+  serverId?: number;
+  /** 已检测并持久化的操作系统标识（已设置则连接时跳过重复检测） */
+  os?: string | null;
   /**
    * Cloudflare DO locationHint。
    * - 用户保存服务器时手动覆盖的 `region` → 优先使用
@@ -59,6 +67,37 @@ export interface SSHConnectionConfig {
    * 连接时仅做白名单过滤（实际取值由 user-db.handleConnectServer 计算）。
    */
   locationHint?: string;
+  /** Saved jump hosts ordered from the public entry hop toward this target. */
+  jumpHosts?: SSHJumpHostConfig[];
+  /** 仅可由 Worker 内部的一次性分享兑换流程写入，客户端输入必须剥离。 */
+  sessionPolicy?: SSHSessionPolicy;
+}
+
+export interface SSHSessionPolicy {
+  source: 'share';
+  shareId: string;
+  /** 用于定位独立 SSHShareDO 的不透明引用，不包含用户或服务器信息。 */
+  shareRef: string;
+  allowAgent: false;
+  allowSftp: boolean;
+  allowMetadataMutation: false;
+  allowHostKeyMutation: false;
+  allowReconnect: false;
+  /** 分享会话的绝对结束时间（Unix 毫秒）。 */
+  sessionExpiresAt: number;
+}
+
+export interface SSHJumpHostConfig {
+  serverId: number;
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  password: string;
+  authMethod: 'password' | 'publickey';
+  privateKey: string;
+  expectedFingerprint?: string;
+  knownHostIdentity: string;
 }
 
 /**
@@ -103,6 +142,7 @@ export function normalizeTerminalSize(cols: unknown, rows: unknown): TerminalSiz
 export interface Env {
   SSH_SESSION: DurableObjectNamespace;
   USER_DB: DurableObjectNamespace;
+  SSH_SHARE: DurableObjectNamespace;
   MAX_CONNECTIONS?: string;
   IDLE_TIMEOUT?: string;
   TURNSTILE_SECRET?: string;
@@ -110,11 +150,17 @@ export interface Env {
   // GitHub OAuth（可选，未配置则登录功能自动禁用）
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
+  // GitHub 登录白名单（可选，逗号分隔的数字 GitHub user ID；未配置则不限制）
+  GITHUB_ALLOWED_USER_IDS?: string;
+  // 是否强制 GitHub 登录后才能使用 SSH（可选，默认 false）
+  REQUIRE_GITHUB_AUTH?: string;
   BASE_URL?: string;
   // 主机密钥验证严格模式（默认 true，设为 false 可跳过签名验证失败）
   STRICT_HOST_KEY_VERIFY?: string;
   // 调试模式（设为 true 启用调试日志输出到前端）
   DEBUG_MODE?: string;
+  // 一次性 SSH 分享（默认关闭；true 时登录用户可创建分享链接）
+  ENABLE_SSH_SHARING?: string;
 }
 
 export interface UserInfo {
@@ -138,6 +184,10 @@ export interface ServerConfig {
   inferred_hint?: string | null;
   /** 用户用于组织和筛选服务器的单层标签 */
   tags: string[];
+  /** 连接时检测到的远端操作系统（canonical key，如 ubuntu/debian/centos） */
+  os?: string | null;
+  /** Optional saved server used as the immediate SSH jump host. */
+  jump_server_id?: number | null;
   created_at: string;
   updated_at: string;
 }
@@ -156,6 +206,11 @@ export const SSH_MSG_KEX_ECDH_REPLY = 31;
 export const SSH_MSG_USERAUTH_REQUEST = 50;
 export const SSH_MSG_USERAUTH_FAILURE = 51;
 export const SSH_MSG_USERAUTH_SUCCESS = 52;
+// User-auth message numbers 60/61 are method-specific. These names apply only
+// while keyboard-interactive is active; 60 is PK_OK/PASSWD_CHANGEREQ in the
+// publickey/password methods and must be disambiguated by session state.
+export const SSH_MSG_USERAUTH_INFO_REQUEST = 60;
+export const SSH_MSG_USERAUTH_INFO_RESPONSE = 61;
 export const SSH_MSG_GLOBAL_REQUEST = 80;
 export const SSH_MSG_REQUEST_SUCCESS = 81;
 export const SSH_MSG_REQUEST_FAILURE = 82;
