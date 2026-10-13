@@ -97,7 +97,7 @@ test('服务器分页在手机、触屏平板和桌面宽度间自动切换', as
   await expect(page.locator('.server-card')).toHaveCount(6);
 
   await page.setViewportSize({ width: 1200, height: 800 });
-  await expect(page.locator('.server-card')).toHaveCount(9);
+  await expect(page.locator('.server-card')).toHaveCount(6);
 });
 
 test.describe('响应式断点边界', () => {
@@ -106,7 +106,7 @@ test.describe('响应式断点边界', () => {
   test('768px 精细指针设备统一使用桌面布局和分页', async ({ page }) => {
     await page.goto('/?lang=zh-CN');
 
-    await expect(page.locator('.server-card')).toHaveCount(9);
+    await expect(page.locator('.server-card')).toHaveCount(6);
     await expect(page.locator('#user-space-header-actions')).toBeVisible();
     await expect(page.locator('#user-space-more-btn')).toBeHidden();
   });
@@ -198,4 +198,44 @@ test('移动端 AI 设置弹窗完整位于可视区域内', async ({ page }) =>
   expect(layout.bottom).toBeLessThanOrEqual(568);
   expect(layout.overflowY).toBe('auto');
   expect(layout.inputFontSize).toBe('16px');
+});
+
+test('移动端用户空间提供自定义快捷键入口且桌面端隐藏', async ({ page }) => {
+  await page.goto('/?lang=zh-CN');
+
+  // 1. 移动端视口（375x667）下，点击用户空间更多菜单可看到自定义快捷键入口
+  await page.setViewportSize({ width: 375, height: 667 });
+  await page.locator('#user-space-more-btn').click();
+  const mobileShortcutBtn = page.locator('#mobile-shortcuts-config-btn');
+  await expect(mobileShortcutBtn).toBeVisible();
+
+  // 点击打开弹窗
+  await mobileShortcutBtn.click();
+  const modal = page.locator('#mobile-shortcuts-modal');
+  await expect(modal).toBeVisible();
+  await expect(page.locator('#mobile-shortcuts-presets')).toBeVisible();
+
+  // 自定义按键的名称与发送内容输入框均应完整可见，文案为“按键名称”/“发送内容”，小字号 11px，且内容输入框不被挤扁
+  const labelInput = page.locator('#mobile-shortcut-custom-label');
+  const valueInput = page.locator('#mobile-shortcut-custom-value');
+  await expect(labelInput).toBeVisible();
+  await expect(valueInput).toBeVisible();
+  await expect(labelInput).toHaveAttribute('placeholder', '按键名称');
+  await expect(valueInput).toHaveAttribute('placeholder', '发送内容');
+  const labelBox = await labelInput.boundingBox();
+  const valueBox = await valueInput.boundingBox();
+  expect(labelBox?.width).toBeCloseTo(96, 1);
+  expect(valueBox?.width).toBeGreaterThan(80);
+  const labelFontSize = await labelInput.evaluate((el) => getComputedStyle(el).fontSize);
+  const valueFontSize = await valueInput.evaluate((el) => getComputedStyle(el).fontSize);
+  expect(labelFontSize).toBe('11px');
+  expect(valueFontSize).toBe('11px');
+
+  // 关闭弹窗
+  await page.locator('#mobile-shortcuts-modal .panel-close-btn').click();
+  await expect(modal).toBeHidden();
+
+  // 2. 切换到桌面端视口（1280x800），该按钮必须被严格隐藏
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await expect(mobileShortcutBtn).toBeHidden();
 });

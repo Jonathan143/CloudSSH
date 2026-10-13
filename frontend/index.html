@@ -70,7 +70,7 @@
                 <div data-language-switcher></div>
                 <span
                   class="material-symbols-outlined text-[var(--accent-secondary)]"
-                  style="font-variation-settings: &quot;FILL&quot; 0"
+                  style="font-variation-settings: 'FILL' 0"
                   >terminal</span
                 >
               </div>
@@ -126,24 +126,8 @@
               <option value="standard-light">Standard Light</option>
               <option value="cyberpunk">Cyberpunk</option>
               <option value="liquid-glass">Liquid Glass</option>
+              <option value="__custom__" data-i18n="theme.custom">Custom</option>
             </select>
-            <button
-              data-theme-import
-              class="theme-toolbar-button user-space-menu-action hover:opacity-80 cursor-pointer p-1 flex items-center justify-center"
-              data-i18n-title="terminal.importTheme"
-              title="导入主题"
-            >
-              <span
-                class="material-symbols-outlined"
-                style="font-variation-settings: &quot;FILL&quot; 0"
-                >upload_file</span
-              >
-              <span
-                class="user-space-action-label"
-                data-i18n="terminal.importTheme"
-                >导入主题</span
-              >
-            </button>
             <div data-language-switcher></div>
             <div id="user-info" class="flex items-center gap-3">
               <!-- 动态渲染：头像 + 用户名 -->
@@ -156,11 +140,28 @@
             >
               <span
                 class="material-symbols-outlined"
-                style="font-variation-settings: &quot;FILL&quot; 0"
+                style="font-variation-settings: 'FILL' 0"
                 >psychology</span
               >
               <span class="user-space-action-label" data-i18n="agent.settings"
                 >AI Agent 设置</span
+              >
+            </button>
+            <button
+              id="mobile-shortcuts-config-btn"
+              type="button"
+              class="user-space-menu-action mobile-only hover:opacity-80 transition-opacity cursor-pointer p-1 flex items-center justify-center"
+              data-i18n-title="mobileShortcuts.title"
+              title="自定义快捷键"
+            >
+              <span
+                class="material-symbols-outlined"
+                style="font-variation-settings: 'FILL' 0"
+                aria-hidden="true"
+                >keyboard</span
+              >
+              <span class="user-space-action-label" data-i18n="mobileShortcuts.title"
+                >自定义快捷键</span
               >
             </button>
             <button
@@ -171,7 +172,7 @@
             >
               <span
                 class="material-symbols-outlined"
-                style="font-variation-settings: &quot;FILL&quot; 0"
+                style="font-variation-settings: 'FILL' 0"
                 >logout</span
               >
               <span class="user-space-action-label" data-i18n="auth.logout"
@@ -291,7 +292,7 @@
                     >
                   </button>
                 </div>
-                <div id="server-tag-filter-wrapper" class="hidden sm:w-52">
+                <div id="server-tag-filter-wrapper" class="hidden sm:w-44">
                   <label
                     for="server-tag-filter"
                     class="sr-only"
@@ -304,6 +305,25 @@
                     data-i18n-aria-label="server.tagFilter"
                     aria-label="按标签筛选"
                   ></select>
+                </div>
+                <div id="server-sort-wrapper" class="sm:w-40">
+                  <label
+                    for="server-sort"
+                    class="sr-only"
+                    data-i18n="server.sortLabel"
+                    >排序方式</label
+                  >
+                  <select
+                    id="server-sort"
+                    class="terminal-input text-[13px] w-full cursor-pointer"
+                    data-i18n-aria-label="server.sortLabel"
+                    aria-label="排序方式"
+                  >
+                    <option value="recent" data-i18n="server.sortRecent">最近连接</option>
+                    <option value="updated" data-i18n="server.sortUpdated">最近修改</option>
+                    <option value="created" data-i18n="server.sortCreated">添加时间</option>
+                    <option value="name" data-i18n="server.sortName">名称 (A-Z)</option>
+                  </select>
                 </div>
               </div>
             </div>
@@ -372,7 +392,7 @@
                 class="material-symbols-outlined text-dim mb-4"
                 style="
                   font-size: 64px;
-                  font-variation-settings: &quot;FILL&quot; 0;
+                  font-variation-settings: 'FILL' 0;
                 "
                 >dns</span
               >
@@ -531,7 +551,7 @@
               </div>
             </div>
             <div class="grid grid-cols-1 sm:grid-cols-4 gap-4">
-              <div class="sm:col-span-3">
+              <div class="sm:col-span-3" id="server-host-field">
                 <label
                   for="server-host"
                   id="server-host-label"
@@ -550,7 +570,7 @@
                   />
                 </div>
               </div>
-              <div class="sm:col-span-1">
+              <div class="sm:col-span-1" id="server-port-field">
                 <label
                   for="server-port"
                   class="block text-xs font-bold tracking-[0.1em] text-muted mb-2"
@@ -571,13 +591,6 @@
                     value="22"
                     required
                   />
-                </div>
-                <div
-                  id="server-port-hint"
-                  class="hidden text-[10px] text-muted mt-1 leading-tight"
-                  data-i18n="server.tunnelPortHint"
-                >
-                  默认 22（实际端口由内网 cloudflared 配置决定）
                 </div>
               </div>
             </div>
@@ -832,6 +845,7 @@
               <option value="standard-light">Standard Light</option>
               <option value="cyberpunk">Cyberpunk</option>
               <option value="liquid-glass">Liquid Glass</option>
+              <option value="__custom__" data-i18n="theme.custom">Custom</option>
             </select>
             <input
               type="file"
@@ -853,7 +867,7 @@
               >
                 <span
                   class="material-symbols-outlined drawer-btn-icon"
-                  style="font-variation-settings: &quot;FILL&quot; 0"
+                  style="font-variation-settings: 'FILL' 0"
                   >folder_open</span
                 >
                 <span class="drawer-btn-label" data-i18n="terminal.drawer.sftp">SFTP</span>
@@ -870,7 +884,7 @@
               >
                 <span
                   class="material-symbols-outlined drawer-btn-icon"
-                  style="font-variation-settings: &quot;FILL&quot; 0"
+                  style="font-variation-settings: 'FILL' 0"
                   >terminal</span
                 >
                 <span class="drawer-btn-label" data-i18n="terminal.drawer.snippets">自定义命令</span>
@@ -887,7 +901,7 @@
               >
                 <span
                   class="material-symbols-outlined drawer-btn-icon"
-                  style="font-variation-settings: &quot;FILL&quot; 0"
+                  style="font-variation-settings: 'FILL' 0"
                   >psychology</span
                 >
                 <span class="drawer-btn-label" data-i18n="terminal.drawer.agent">Agent</span>
@@ -901,7 +915,7 @@
             >
               <span
                 class="material-symbols-outlined"
-                style="font-variation-settings: &quot;FILL&quot; 0"
+                style="font-variation-settings: 'FILL' 0"
                 >search</span
               >
             </button>
@@ -913,7 +927,7 @@
             >
               <span
                 class="material-symbols-outlined"
-                style="font-variation-settings: &quot;FILL&quot; 0"
+                style="font-variation-settings: 'FILL' 0"
                 >download</span
               >
             </button>
@@ -925,7 +939,7 @@
             >
               <span
                 class="material-symbols-outlined"
-                style="font-variation-settings: &quot;FILL&quot; 0"
+                style="font-variation-settings: 'FILL' 0"
                 >power_settings_new</span
               >
             </button>
@@ -960,6 +974,7 @@
                 <option value="standard-light">Standard Light</option>
                 <option value="cyberpunk">Cyberpunk</option>
                 <option value="liquid-glass">Liquid Glass</option>
+                <option value="__custom__" data-i18n="theme.custom">Custom</option>
               </select>
             </label>
             <button id="mobile-search-btn" type="button">
@@ -971,6 +986,11 @@
               <span class="material-symbols-outlined" aria-hidden="true"
                 >terminal</span
               ><span data-i18n="snippets.title">Command snippets</span>
+            </button>
+            <button id="mobile-shortcuts-terminal-btn" type="button" class="hidden">
+              <span class="material-symbols-outlined" aria-hidden="true"
+                >keyboard</span
+              ><span data-i18n="mobileShortcuts.title">自定义快捷键</span>
             </button>
             <button id="mobile-sftp-btn" type="button">
               <span class="material-symbols-outlined" aria-hidden="true"
@@ -999,10 +1019,12 @@
           </div>
         </header>
 
-        <!-- Tab Bar（标签栏） -->
+        <!-- Tab Bar（标签栏）：仅允许横向滚动。overflow-x-auto 会把 overflow-y 隐式变为 auto，
+             而标签项上下各 3px margin 的 margin-box 比 36px 高度减去 1px 下边框后多出 1px，
+             会在右侧绘制一条无效纵向滚动条，必须显式 overflow-y-hidden 禁止。 -->
         <div
           id="tab-bar"
-          class="flex items-center bg-background border-b border-outline-variant px-2 h-9 overflow-x-auto custom-scrollbar gap-0.5"
+          class="flex items-center bg-background border-b border-outline-variant px-2 h-9 overflow-x-auto overflow-y-hidden custom-scrollbar gap-0.5"
           style="scrollbar-width: thin"
         >
           <!-- 由 TabManager 动态渲染标签 -->
@@ -1175,7 +1197,7 @@
         >
           <span
             class="material-symbols-outlined"
-            style="font-size: 16px; font-variation-settings: &quot;FILL&quot; 0"
+            style="font-size: 16px; font-variation-settings: 'FILL' 0"
             aria-hidden="true"
             >quick_phrases</span
           >

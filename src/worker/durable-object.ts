@@ -626,6 +626,8 @@ export class SSHSessionDO {
         23, 80, 443, 25, 465, 587, 110, 143, 993, 995, 3306, 5432, 6379, 9200, 11211, 27017, 5060,
       ];
 
+      const debugMode = this.env.DEBUG_MODE === 'true';
+
       let transport: any;
       let latency = 0;
 
@@ -653,43 +655,68 @@ export class SSHSessionDO {
         }
 
         const tunnelUrl = `https://${tunnelHost}/`;
-        const headers: Record<string, string> = {
-          Upgrade: 'websocket',
-        };
-        if (config.cfAccessClientId && config.cfAccessClientSecret) {
-          headers['CF-Access-Client-Id'] = config.cfAccessClientId;
-          headers['CF-Access-Client-Secret'] = config.cfAccessClientSecret;
+        const headers: Record<string, string> = {};
+        headers.Upgrade = 'websocket';
+        headers.Connection = 'Upgrade';
+        headers['Sec-WebSocket-Version'] = '13';
+        const clientId = (config.cfAccessClientId || '').trim();
+        const clientSecret = (config.cfAccessClientSecret || '').trim();
+        if (clientId) {
+          headers['CF-Access-Client-Id'] = clientId;
+        }
+        if (clientSecret) {
+          headers['CF-Access-Client-Secret'] = clientSecret;
         }
 
         const startTime = Date.now();
         let resp: Response;
         try {
-          resp = await fetch(tunnelUrl, { headers });
+          // redirect: 'manual' 是必需项：默认 follow 会把 Zero Trust 的 302 跟随到
+          // 登录页（使下方 3xx 诊断分支失效），并把 Service Token 转发给重定向目标。
+          resp = await fetch(tunnelUrl, { headers, redirect: 'manual' });
         } catch (fetchErr) {
           const msg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
           throw new Error(`Cloudflare 隧道连接失败 (${tunnelHost}): ${msg}`);
         }
 
         if (resp.status === 401 || resp.status === 403) {
+          const cfRay = resp.headers.get('cf-ray');
+          const hasCredentials = Boolean(clientId && clientSecret);
+          const detail = hasCredentials
+            ? `已携带 Service Token (Client ID: ${clientId})，但访问被拒绝 (${resp.status})`
+            : `未配置完整的 Service Token 凭据 (Client ID: ${clientId ? '已配置' : '未配置'}, Client Secret: ${clientSecret ? '已配置' : '未配置'})`;
+          const rayInfo = cfRay ? ` [CF-RAY: ${cfRay}]` : '';
           throw new Error(
-            `Cloudflare Zero Trust 访问被拒绝 (${resp.status})：请检查是否需要配置 Service Token (Client ID / Client Secret)`
+            `Cloudflare Zero Trust 访问被拒绝 (${resp.status})：${detail}${rayInfo}。若启用了 Access 保护，请在 Cloudflare Zero Trust 中确保包含该 Service Token 策略 (Action: Service Auth) 并在服务器设置中正确填入。`
           );
         }
         if (resp.status === 301 || resp.status === 302) {
+          const cfRay = resp.headers.get('cf-ray');
+          const rayInfo = cfRay ? ` [CF-RAY: ${cfRay}]` : '';
           throw new Error(
-            'Cloudflare 隧道被重定向到认证页面：若启用了 Zero Trust 访问控制，请在 Cloudflare 配置 Service Token 并在服务器设置中填入'
+            `Cloudflare 隧道被重定向到认证页面 (${resp.status})${rayInfo}：若启用了 Zero Trust 访问控制，请在 Cloudflare 配置 Service Token (Policy Action: Service Auth) 并在服务器设置中填入`
           );
         }
 
         const tunnelWs = resp.webSocket;
         if (!tunnelWs) {
+          const cfRay = resp.headers.get('cf-ray');
+          const rayInfo = cfRay ? ` [CF-RAY: ${cfRay}]` : '';
           throw new Error(
-            `Cloudflare 隧道未能升级为 WebSocket (HTTP ${resp.status} ${resp.statusText})`
+            `Cloudflare 隧道未能升级为 WebSocket (HTTP ${resp.status} ${resp.statusText})${rayInfo}`
           );
         }
 
         tunnelWs.accept();
-        transport = new TunnelWebSocketStream(tunnelWs);
+        transport = new TunnelWebSocketStream(tunnelWs, (msg) => {
+          if (debugMode) {
+            try {
+              ws.send(JSON.stringify({ type: 'debug', message: msg }));
+            } catch {
+              /* ignore */
+            }
+          }
+        });
         await transport.opened;
         latency = Date.now() - startTime;
       } else {
@@ -733,7 +760,6 @@ export class SSHSessionDO {
         config.sessionPolicy?.source === 'share'
           ? true
           : this.env.STRICT_HOST_KEY_VERIFY !== 'false';
-      const debugMode = this.env.DEBUG_MODE === 'true';
       const pendingSize = this.pendingTerminalSizes.get(ws);
       if (pendingSize) {
         config.cols = pendingSize.cols;
