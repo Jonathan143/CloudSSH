@@ -1,6 +1,7 @@
 import { AIConfigPanel } from './ai-config';
 import { openAdminHashGeneratorDialog } from './admin-hash-generator';
 import { ConnectionForm } from './auth-form';
+import { clearLegacyAgentSessionDrafts, clearUserAgentSessionDrafts } from './agent/session-draft';
 import { initI18n, onLocaleChange, t } from './i18n';
 import { MobileTerminalController } from './mobile-terminal';
 import { MobileShortcutsManager } from './mobile-shortcuts-manager';
@@ -26,6 +27,7 @@ import { LiquidSegmentedThemeControl } from './theme-segmented';
 import { LiquidSegmentedDrawerControl } from './drawer-segmented';
 import { customThemeModal, customThemeStore } from './custom-theme-manager';
 import { notify } from './ui-feedback';
+import { initVersionNotice } from './version-notice';
 
 // ==================== 全局状态 ====================
 
@@ -33,6 +35,7 @@ let tabManager: TabManager | null = null;
 let connectionForm: ConnectionForm | null = null;
 let serverList: ServerList | null = null;
 let isLoggedIn = false;
+let currentGithubId: number | null = null;
 let sharedSessionMode = false;
 const mobileShortcutsManager = new MobileShortcutsManager();
 const mobileTerminalController = new MobileTerminalController(
@@ -90,7 +93,7 @@ function getTabManager(): TabManager {
     tabManager.setAllTabsClosedHandler(() => {
       showOfflineUI();
     });
-    tabManager.setLoggedIn(isLoggedIn);
+    tabManager.setUser(currentGithubId);
     // 连接后检测到操作系统 → 即时更新服务器列表卡片图标
     tabManager.setOSDetectedHandler((serverId, os) => {
       serverList?.updateServerOS(serverId, os);
@@ -284,7 +287,13 @@ function showUserSpace(user: {
   avatar_url: string | null;
 }): void {
   deactivateTerminalView();
+  const previousGithubId = currentGithubId;
   isLoggedIn = true;
+  currentGithubId = user.github_id;
+  tabManager?.setUser(currentGithubId);
+  if (previousGithubId !== null && previousGithubId !== currentGithubId) {
+    clearUserAgentSessionDrafts(previousGithubId);
+  }
   customThemeStore.setLoggedIn(true);
   document.getElementById('auth-section')!.classList.add('hidden');
   document.getElementById('user-space-section')!.classList.remove('hidden');
@@ -304,11 +313,13 @@ function showUserSpace(user: {
     // onLogout 回调
     () => {
       isLoggedIn = false;
+      currentGithubId = null;
       customThemeStore.setLoggedIn(false);
       serverList = null;
-      if (tabManager) {
-        tabManager.closeAllTabs();
-      }
+      tabManager?.setUser(null);
+      // Dispose panels before clearing storage so late frames cannot recreate drafts.
+      clearUserAgentSessionDrafts(user.github_id);
+      clearLegacyAgentSessionDrafts();
       showAuthSection();
     },
     // onConnect 回调 — 在当前页面创建新标签
@@ -889,11 +900,14 @@ async function restoreCloudTheme(
 // ==================== 初始化 ====================
 
 /**
- * macOS 26 液态玻璃动态指针天光追踪：
- * 仅在 liquid 风格下监听 pointermove 并通过 requestAnimationFrame 节流更新 --mx 和 --my，
+ * 卡片指针聚光追踪（全主题通用）：
+ * 监听 pointermove 并通过 requestAnimationFrame 节流更新 --mx 和 --my，
  * 纯变量传导，零 DOM 重排，GPU 仅更新 radial-gradient 聚光位置。
+ * 触屏设备无悬停语义（CSS 侧同步隐藏聚光层），直接不注册以省电。
  */
 function initPointerSpecularTracking(): void {
+  if (window.matchMedia?.('(hover: none) and (pointer: coarse)').matches) return;
+
   let rafId: number | null = null;
   let targetCard: HTMLElement | null = null;
   let px = 50;
@@ -902,9 +916,8 @@ function initPointerSpecularTracking(): void {
   document.addEventListener(
     'pointermove',
     (e: PointerEvent) => {
-      if (document.documentElement.dataset.uiStyle !== 'liquid') return;
       const card = (e.target as HTMLElement | null)?.closest?.(
-        '.server-card, .cyber-box'
+        '.server-card, .cyber-box, .sftp-entry'
       ) as HTMLElement | null;
       if (!card) {
         targetCard = null;
@@ -949,6 +962,7 @@ function consumeAdminSetupRoute(): void {
 }
 
 async function init(): Promise<void> {
+  clearLegacyAgentSessionDrafts();
   initI18n();
   initUserSpaceMobileMenu();
   initServerPaginationBreakpoints();
@@ -1024,6 +1038,9 @@ async function init(): Promise<void> {
     renderShareLanding(shareToken, showSharedTerminal);
     return;
   }
+
+  // Optional metadata check is never awaited; share recipients do not need deployment hints.
+  initVersionNotice();
 
   // 独立终端标签页模式：URL 包含 wsUrl 参数
   if (isTerminalTab()) {

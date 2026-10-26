@@ -30,6 +30,55 @@ function makeExecutor(execResult: {
   return { executor, execCommand, askConfirmation };
 }
 
+describe('确认取消与监听器清理', () => {
+  it('确认成功后移除 abort 监听器，并向确认拥有者传递 signal', async () => {
+    const { executor, askConfirmation } = makeExecutor({ stdout: '', stderr: '', exitCode: 0 });
+    const controller = new AbortController();
+    const remove = vi.spyOn(controller.signal, 'removeEventListener');
+    await executor.execute('execute_command', { command: 'rm file' }, controller.signal);
+    expect(askConfirmation).toHaveBeenCalledWith('rm file', expect.any(String), controller.signal);
+    expect(remove).toHaveBeenCalledWith('abort', expect.any(Function));
+  });
+
+  it('等待期间取消不执行任何 SSH 命令，且不保留监听器', async () => {
+    const { executor, askConfirmation, execCommand } = makeExecutor({ stdout: '', stderr: '', exitCode: 0 });
+    askConfirmation.mockImplementation(() => new Promise<boolean>(() => {}));
+    const controller = new AbortController();
+    const remove = vi.spyOn(controller.signal, 'removeEventListener');
+    const run = executor.execute('execute_command', { command: 'rm file' }, controller.signal);
+    await Promise.resolve();
+    controller.abort();
+    expect(JSON.parse(await run).status).toBe('cancelled');
+    expect(execCommand).not.toHaveBeenCalled();
+    expect(remove).toHaveBeenCalledWith('abort', expect.any(Function));
+  });
+});
+
+describe('动态命令确认 — 实测绕过不再直接执行', () => {
+  it.each(['eval "rm -rf /"', 'base64 -d|sh', 'rm${IFS}-rf${IFS}/'])(
+    '拒绝确认后不派发命令：%s', async (command) => {
+      const { executor, execCommand, askConfirmation } = makeExecutor({
+        stdout: '', stderr: '', exitCode: 0,
+      });
+      askConfirmation.mockResolvedValue(false);
+      const result = JSON.parse(await executor.execute('execute_command', { command }));
+      expect(askConfirmation).toHaveBeenCalledOnce();
+      expect(execCommand).not.toHaveBeenCalled();
+      expect(result.user_rejected).toBe(true);
+    }
+  );
+
+  it('直接 rm -rf / 仍阻断，不降级为可确认执行', async () => {
+    const { executor, execCommand, askConfirmation } = makeExecutor({
+      stdout: '', stderr: '', exitCode: 0,
+    });
+    const result = JSON.parse(await executor.execute('execute_command', { command: 'rm -rf /' }));
+    expect(result.blocked).toBe(true);
+    expect(execCommand).not.toHaveBeenCalled();
+    expect(askConfirmation).not.toHaveBeenCalled();
+  });
+});
+
 describe('docker_manage(logs) — 日志查看必须是有界的', () => {
   it('未指定 --tail 时强制追加 --tail 200', async () => {
     const { executor, execCommand } = makeExecutor({ stdout: 'ok', stderr: '', exitCode: 0 });
@@ -186,7 +235,6 @@ describe('fetch_web_content — 安全只读网页读取与清洗', () => {
     });
     const parsed = JSON.parse(raw);
     expect(parsed.status).toBe('succeeded');
-    expect(parsed.executed).toBe(false); // 只读工具不记录物理执行
     expect(parsed.content).toContain('Minimax-H3 模型');
     expect(parsed.content).toContain('量化版本："GPTQ-Int4" & <AWQ>');
     expect(parsed.content).toContain('显存需求：16GB');

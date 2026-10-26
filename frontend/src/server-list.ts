@@ -3,6 +3,7 @@ import { isValidTunnelHostname, maskIPAddress } from './host-display';
 import { getLocale, onLocaleChange, t } from './i18n';
 import { osDisplayName, osIconSvg } from './os-icons';
 import { parsePort } from './port';
+import { preparePrivateKey } from './private-key-import';
 import { populateRegionSelect, regionLabel } from './regions';
 import { ShareManager } from './share-manager';
 import type { SSHHostInfo } from './terminal';
@@ -23,7 +24,7 @@ export interface ServerConfig {
   host: string;
   port: number;
   username: string;
-  auth_method: 'password' | 'publickey';
+  auth_method: 'password' | 'publickey' | 'none';
   region?: string | null;
   inferred_hint?: string | null;
   tags: string[];
@@ -45,7 +46,7 @@ interface ServerSavePayload {
   host: string;
   port: number;
   username: string;
-  auth_method: 'password' | 'publickey';
+  auth_method: 'password' | 'publickey' | 'none';
   tags: string[];
   credential?: string;
   region?: string;
@@ -184,8 +185,9 @@ export class ServerList {
   private onConnect: (wsUrl: string, serverName: string, hostInfo?: SSHHostInfo) => void;
   private editingServerId: number | null = null;
   private editingOriginalAuthMethod: ServerConfig['auth_method'] | null = null;
-  private modalAuthMode: 'password' | 'key' = 'password';
+  private modalAuthMode: 'password' | 'key' | 'none' = 'password';
   private modalTransportMode: 'direct' | 'cf_tunnel' = 'direct';
+  private modalGeneration = 0;
   private clearCfAccessClientSecret = false;
   private searchQuery = '';
   private selectedTag = '';
@@ -218,6 +220,7 @@ export class ServerList {
   private async init(): Promise<void> {
     this.renderUserInfo();
     this.bindEvents();
+    this.renderSkeletonGrid();
     await Promise.all([this.fetchSharingConfig(), this.fetchServers()]);
     this.renderServerGrid();
 
@@ -362,6 +365,10 @@ export class ServerList {
       void this.handleSubmit();
     });
 
+    document.getElementById('server-empty-password')?.addEventListener('change', () => {
+      this.setModalAuthMode(this.modalAuthMode);
+    });
+
     // Modal 认证方式切换
     document
       .getElementById('modal-auth-tab-password')
@@ -369,6 +376,9 @@ export class ServerList {
     document
       .getElementById('modal-auth-tab-key')
       ?.addEventListener('click', () => this.setModalAuthMode('key'));
+    document
+      .getElementById('modal-auth-tab-none')
+      ?.addEventListener('click', () => this.setModalAuthMode('none'));
     document
       .getElementById('modal-transport-tab-direct')
       ?.addEventListener('click', () => this.setModalTransportMode('direct'));
@@ -433,6 +443,7 @@ export class ServerList {
     const tagFilter = document.getElementById('server-tag-filter') as HTMLSelectElement | null;
     const pagination = document.getElementById('server-pagination');
     if (!grid || !emptyState || !searchWrapper || !searchEmptyState) return;
+    grid.removeAttribute('aria-busy');
 
     if (this.servers.length === 0) {
       grid.innerHTML = '';
@@ -491,7 +502,9 @@ export class ServerList {
     const visibleServers = page.items;
 
     // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
-    grid.innerHTML = visibleServers.map((server) => this.renderServerCard(server)).join('');
+    grid.innerHTML = visibleServers
+      .map((server, index) => this.renderServerCard(server, index, this.searchQuery === ''))
+      .join('');
 
     // 绑定卡片事件
     for (const server of visibleServers) {
@@ -546,6 +559,22 @@ export class ServerList {
     }
   }
 
+  /** 冷加载骨架屏：按当前分页尺寸渲染占位卡片，fetchServers 完成后由 renderServerGrid 整体替换 */
+  private renderSkeletonGrid(): void {
+    const grid = document.getElementById('server-grid');
+    if (!grid) return;
+    grid.setAttribute('aria-busy', 'true');
+    const skeletonCard = `<div class="skeleton-card" aria-hidden="true">
+      <div class="skeleton-line" style="width: 55%"></div>
+      <div class="skeleton-line" style="width: 80%"></div>
+      <div class="skeleton-line" style="width: 70%"></div>
+      <div class="skeleton-line" style="width: 75%"></div>
+      <div class="skeleton-line" style="width: 100%; height: 28px; margin-top: 8px"></div>
+    </div>`;
+    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+    grid.innerHTML = Array.from({ length: this.pageSize }, () => skeletonCard).join('');
+  }
+
   /** 渲染服务器名称前的图标：已识别操作系统 → 品牌 SVG，否则回退到默认 dns 图标 */
   private renderOSIconMarkup(os: string | null | undefined): string {
     const svg = osIconSvg(os);
@@ -556,9 +585,13 @@ export class ServerList {
     return `<span class="material-symbols-outlined text-primary shrink-0" style="font-size: 20px; font-variation-settings: 'FILL' 0;">dns</span>`;
   }
 
-  private renderServerCard(server: ServerConfig): string {
-    const authIcon = server.auth_method === 'publickey' ? 'vpn_key' : 'password';
-    const authLabel = server.auth_method === 'publickey' ? 'KEY' : 'PWD';
+  private renderServerCard(server: ServerConfig, index = 0, animate = false): string {
+    const authIcon =
+      server.auth_method === 'none'
+        ? 'person'
+        : server.auth_method === 'publickey' ? 'vpn_key' : 'password';
+    const authLabel =
+      server.auth_method === 'none' ? 'NONE' : server.auth_method === 'publickey' ? 'KEY' : 'PWD';
     const isTunnel = server.transport_type === 'cf_tunnel';
     const tunnelBadge = isTunnel
       ? `<span class="shrink-0 text-[10px] font-bold tracking-[0.1em] text-[var(--accent-secondary)] border border-[var(--accent-secondary)] px-1.5 py-0.5">${t('server.tunnelBadge')}</span>`
@@ -623,7 +656,7 @@ export class ServerList {
       : '';
 
     return `
-      <div class="server-card p-5 relative group" id="card-${server.id}">
+      <div class="server-card p-5 relative group${animate ? ' server-card--enter' : ''}" id="card-${server.id}"${animate ? ` style="--stagger-index: ${index}"` : ''}>
         <div class="absolute top-0 left-0 w-full h-[2px] bg-gradient-to-r from-transparent via-[var(--border-strong)] to-transparent group-hover:via-[var(--accent)] transition-all duration-300"></div>
 
         <div class="flex items-start justify-between gap-2 mb-3">
@@ -789,6 +822,7 @@ export class ServerList {
   // ==================== Modal 操作 ====================
 
   showModal(mode: 'add' | 'edit' | 'clone', server?: ServerConfig): void {
+    this.modalGeneration++;
     this.editingServerId = mode === 'edit' && server ? server.id : null;
     this.editingOriginalAuthMethod = mode === 'edit' && server ? server.auth_method : null;
 
@@ -796,6 +830,8 @@ export class ServerList {
     const title = document.getElementById('modal-title');
     const submitBtn = document.getElementById('server-submit-btn');
     if (!modal || !title || !submitBtn) return;
+    (submitBtn as HTMLButtonElement).disabled = false;
+    (document.getElementById('server-empty-password') as HTMLInputElement).checked = false;
 
     if (mode === 'add') {
       title.textContent = t('server.add');
@@ -824,11 +860,9 @@ export class ServerList {
         ', '
       );
 
-      if (server.auth_method === 'publickey') {
-        this.setModalAuthMode('key');
-      } else {
-        this.setModalAuthMode('password');
-      }
+      this.setModalAuthMode(
+        server.auth_method === 'publickey' ? 'key' : server.auth_method === 'none' ? 'none' : 'password'
+      );
 
       const transport = server.transport_type === 'cf_tunnel' ? 'cf_tunnel' : 'direct';
       this.setModalTransportMode(transport);
@@ -918,13 +952,13 @@ export class ServerList {
     modal.classList.remove('hidden');
     modal.classList.add('flex');
 
-    // 聚焦第一个输入框
-    setTimeout(() => {
-      (document.getElementById('server-name') as HTMLInputElement)?.focus();
-    }, 100);
+    // Focus synchronously once visible: a delayed callback can steal focus from a
+    // field the user has already started editing, or from a newer dialog.
+    (document.getElementById('server-name') as HTMLInputElement)?.focus({ preventScroll: true });
   }
 
   hideModal(): void {
+    this.modalGeneration++;
     const modal = document.getElementById('server-modal');
     if (modal) {
       modal.classList.add('hidden');
@@ -995,17 +1029,27 @@ export class ServerList {
     }
   }
 
-  private setModalAuthMode(mode: 'password' | 'key'): void {
+  private setModalAuthMode(mode: 'password' | 'key' | 'none'): void {
     this.modalAuthMode = mode;
-    const pwTab = document.getElementById('modal-auth-tab-password')!;
-    const keyTab = document.getElementById('modal-auth-tab-key')!;
-    const pwSection = document.getElementById('modal-password-section')!;
-    const keySection = document.getElementById('modal-key-section')!;
-
-    pwTab.classList.toggle('auth-tab-active', mode === 'password');
-    keyTab.classList.toggle('auth-tab-active', mode === 'key');
-    pwSection.style.display = mode === 'password' ? '' : 'none';
-    keySection.style.display = mode === 'key' ? '' : 'none';
+    for (const value of ['password', 'key', 'none'] as const) {
+      const tab = document.getElementById(`modal-auth-tab-${value}`)!;
+      tab.classList.toggle('auth-tab-active', mode === value);
+      tab.setAttribute('aria-pressed', String(mode === value));
+      document.getElementById(`modal-${value}-section`)!.style.display = mode === value ? '' : 'none';
+    }
+    const editingPassword =
+      mode === 'password' &&
+      this.editingServerId !== null &&
+      this.editingOriginalAuthMethod === 'password';
+    const emptyPassword = document.getElementById('server-empty-password') as HTMLInputElement;
+    document.getElementById('server-empty-password-option')!
+      .classList.toggle('hidden', !editingPassword);
+    (document.getElementById('server-password') as HTMLInputElement).disabled =
+      editingPassword && emptyPassword.checked;
+    const hint = document.getElementById('server-password-hint')!;
+    const hintKey = editingPassword ? 'server.passwordEditHint' : 'auth.passwordHint';
+    hint.dataset.i18n = hintKey;
+    hint.textContent = t(hintKey);
   }
 
   private getJumpPath(server: ServerConfig): string[] {
@@ -1100,6 +1144,9 @@ export class ServerList {
   }
 
   private async handleSubmit(): Promise<void> {
+    const generation = this.modalGeneration;
+    const editingServerId = this.editingServerId;
+    if ((document.getElementById('server-submit-btn') as HTMLButtonElement).disabled) return;
     const name = (document.getElementById('server-name') as HTMLInputElement).value.trim();
     const host = (document.getElementById('server-host') as HTMLInputElement).value.trim();
     const portInput = document.getElementById('server-port') as HTMLInputElement;
@@ -1143,26 +1190,31 @@ export class ServerList {
       return;
     }
 
-    const authMethod = this.modalAuthMode === 'key' ? 'publickey' : 'password';
-    const credential = authMethod === 'publickey' ? privateKey : password;
+    const authMethod = this.modalAuthMode === 'key' ? 'publickey' : this.modalAuthMode;
+    const useEmptyPassword =
+      authMethod === 'password' &&
+      (document.getElementById('server-empty-password') as HTMLInputElement).checked;
+    let credential =
+      authMethod === 'none' || useEmptyPassword
+        ? ''
+        : authMethod === 'publickey' ? privateKey : password;
     const authMethodChanged =
       this.editingServerId !== null &&
       this.editingOriginalAuthMethod !== null &&
       authMethod !== this.editingOriginalAuthMethod;
 
-    // 新增或切换认证方式时必须填写与新方式匹配的凭据
-    if ((!this.editingServerId || authMethodChanged) && !credential) {
+    // 只有私钥必须非空；编辑已有密码时留空仍保留原值，除非明确勾选设为空密码。
+    if (authMethod === 'publickey' && (!this.editingServerId || authMethodChanged) && !credential) {
       notify(
         authMethodChanged
           ? t('server.credentialRequiredAfterAuthChange')
-          : t(authMethod === 'publickey' ? 'auth.validationPrivateKey' : 'auth.validationPassword'),
+          : t('auth.validationPrivateKey'),
         {
           title: t('auth.incompleteCredentials'),
           variant: 'warning',
         }
       );
-      const credentialId = authMethod === 'publickey' ? 'server-private-key' : 'server-password';
-      (document.getElementById(credentialId) as HTMLInputElement | HTMLTextAreaElement)?.focus();
+      (document.getElementById('server-private-key') as HTMLTextAreaElement)?.focus();
       return;
     }
 
@@ -1191,6 +1243,15 @@ export class ServerList {
     `;
 
     try {
+      if (authMethod === 'publickey' && credential) {
+        const prepared = await preparePrivateKey(credential, true);
+        if (!prepared || generation !== this.modalGeneration || this.modalAuthMode !== 'key' ||
+            (document.getElementById('server-host') as HTMLInputElement).value.trim() !== host ||
+            (document.getElementById('server-username') as HTMLInputElement).value.trim() !== username ||
+            (document.getElementById('server-private-key') as HTMLTextAreaElement).value !== privateKey ||
+            (this.modalTransportMode === 'cf_tunnel') !== isTunnel) return;
+        credential = prepared.key;
+      }
       const body: ServerSavePayload = {
         name,
         host,
@@ -1201,7 +1262,12 @@ export class ServerList {
         transport_type: this.modalTransportMode,
         jump_server_id: isTunnel ? null : jumpServerId,
       };
-      if (credential) body.credential = credential;
+      if (
+        credential ||
+        (authMethod === 'password' && (!this.editingServerId || authMethodChanged || useEmptyPassword))
+      ) {
+        body.credential = credential;
+      }
 
       if (isTunnel && cleanTunnelHost) {
         body.cf_tunnel_host = cleanTunnelHost;
@@ -1227,8 +1293,8 @@ export class ServerList {
 
       // 保存请求（后端在保存时会同步推断 locationHint，故时间可能略长）
       let res: Response;
-      if (this.editingServerId) {
-        res = await fetch(`/api/servers/${this.editingServerId}`, {
+      if (editingServerId) {
+        res = await fetch(`/api/servers/${editingServerId}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
@@ -1297,12 +1363,15 @@ export class ServerList {
         variant: 'danger',
       });
     } finally {
-      submitBtn.disabled = false;
-    // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
-      submitBtn.innerHTML = `
-        <span class="material-symbols-outlined" style="font-size: 18px;">save</span>
-        ${this.editingServerId ? t('server.update') : t('server.save')}
-      `;
+      // An old unlock/save must never mutate a subsequently opened editor's controls.
+      if (generation === this.modalGeneration) {
+        submitBtn.disabled = false;
+        // pi-lens-ignore: no-inner-html, ts-xss-dom-sink
+        submitBtn.innerHTML = `
+          <span class="material-symbols-outlined" style="font-size: 18px;">save</span>
+          ${this.editingServerId ? t('server.update') : t('server.save')}
+        `;
+      }
     }
   }
 

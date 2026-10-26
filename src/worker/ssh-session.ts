@@ -13,12 +13,17 @@ import {
   SSHChannel,
 } from '../ssh/channel';
 import {
-  base64UrlEncodeUnsigned,
-  convertSSHECDSASig,
   SSHAESCTRCipher,
   SSHAESGCMCipher,
   SSHHMAC,
 } from '../ssh/crypto';
+import {
+  assertHostKeyAlgorithm,
+  fingerprintHostKey,
+  parsePresentedHostKey,
+  type PresentedHostKey,
+  verifySSHSignature,
+} from '../ssh/host-key';
 import {
   filterExtInfo,
   KEXInitBuilder,
@@ -32,11 +37,12 @@ import { KeyDerivation } from '../ssh/keys';
 import { nextSequenceNumber, SSHPacketBuilder, SSHPacketParser } from '../ssh/packet';
 import { SSHTransport } from '../ssh/transport';
 import type { Env } from '../types';
-import type { AgentTaskCheckpoint } from '../agent-task-schema';
+import { normalizeResponseDiagnostics, responseErrorDebugMessage } from '../agent-response-diagnostics';
 import { DetachedSessionBuffer } from './ssh-detached-buffer';
 import { KeyboardInteractiveAuthHandler, type PendingAuthChallenge } from './ssh-interactive-auth';
 import { parseIdleTimeout } from './idle-timeout';
 import { ShareAuditWriter } from './share-audit-writer';
+import { TerminalOutputGuard } from './terminal-output-guard';
 import {
   normalizeTerminalSize,
   type SessionKeys,
@@ -74,7 +80,8 @@ import {
 import { AgentCore } from './agent/core';
 import { AgentExecChannel } from './agent/exec-channel';
 import { TerminalContext } from './agent/terminal-context';
-import type { AgentMemoryProvider, UnifiedServerMemory } from './agent/types';
+import type { AgentMemoryProvider } from './agent/types';
+import { createAgentMemoryProvider } from './agent/memory-provider';
 import { DirectTcpipStream } from './direct-tcpip-stream';
 import { detectAndPersistRemoteOS } from './os-detect';
 import { SFTPHandler } from './sftp-handler';
@@ -110,6 +117,10 @@ export interface SSHSessionOptions {
    * 未传入时从 env.IDLE_TIMEOUT 解析，默认 30 分钟；0 表示禁用。
    */
   idleTimeoutMs?: number;
+  /** Cloudflare PoP 数据中心标识（如 HKG、SJC 等） */
+  colo?: string;
+  /** 周期性测量到远端 SSH 主机 RTT 后的回调，便于 DO 同步更新基线缓存 */
+  onRttUpdated?: (latency: number, colo: string) => void;
 }
 
 export class SSHSession {
@@ -150,6 +161,8 @@ export class SSHSession {
   private kexInitRemote: Uint8Array | null = null;
 
   private negotiatedKexAlgorithm: string | null = null;
+  private negotiatedHostKeyAlgorithm: string | null = null;
+  private acceptedHostKeyFingerprint: string | null = null;
   private ecdhKeyPair: CryptoKeyPair | null = null;
   private curve25519KeyPair: Curve25519KeyPair | null = null;
   private kexRawPublicKey: Uint8Array | null = null;
@@ -206,6 +219,9 @@ export class SSHSession {
   private readonly maxKeepaliveFails: number = 3;
   private keepalivePending: boolean = false;
   private keepaliveTimeout: ReturnType<typeof setTimeout> | null = null;
+  private keepaliveSentAt: number | null = null;
+  private colo: string = 'UNKNOWN';
+  private readonly onRttUpdated?: (latency: number, colo: string) => void;
   private lastPacketAt: number = Date.now();
   private lastUserActivityAt: number = Date.now();
   private idleWarningEmitted: boolean = false;
@@ -230,7 +246,13 @@ export class SSHSession {
     }
   > = new Map();
   private channelWindowWaiters: Map<number, Array<() => void>> = new Map();
-  private confirmationResolve: ((approved: boolean) => void) | null = null;
+  private pendingAgentConfirmation: {
+    id: string;
+    command: string;
+    resolve: (approved: boolean) => void;
+    signal?: AbortSignal;
+    onAbort: () => void;
+  } | null = null;
   private env: Env | null = null;
   private userId: string | null = null;
   private githubId: string | null = null;
@@ -255,6 +277,10 @@ export class SSHSession {
   private authenticatedSettled = false;
   private closed = false;
   private readonly detachedBuffer = new DetachedSessionBuffer();
+  private outputFlowAnnounced = false;
+  private readonly terminalOutputGuard = new TerminalOutputGuard(() => {
+    this.closeForOutputBacklog();
+  });
 
   get detachedBufferBytes(): number {
     return this.detachedBuffer.detachedBufferBytes;
@@ -300,6 +326,8 @@ export class SSHSession {
     this.ownsWebSocket = options.ownsWebSocket !== false;
     this.allowKeyboardInteractive = options.allowKeyboardInteractive !== false;
     this.waitUntil = options.waitUntil;
+    this.colo = options.colo || 'UNKNOWN';
+    this.onRttUpdated = options.onRttUpdated;
     this.idleTimeoutMs =
       options.idleTimeoutMs !== undefined
         ? options.idleTimeoutMs
@@ -447,13 +475,14 @@ export class SSHSession {
     let leftover: Uint8Array | null = null;
 
     try {
-      while (true) {
+      while (!this.closed) {
         let value: Uint8Array;
         if (leftover) {
           value = leftover;
           leftover = null;
         } else {
           const result = await reader.read();
+          if (this.closed) break;
           if (result.done) {
             this.sendError('SSH 服务器断开连接 (Socket closed by remote)', 'remote_closed');
             this.close();
@@ -645,7 +674,7 @@ export class SSHSession {
   }
 
   private async processPackets(): Promise<void> {
-    while (true) {
+    while (!this.closed) {
       // Encryption state changes after handling SSH_MSG_NEWKEYS
       // (handlePacket -> enableEncryption). The first encrypted packet can
       // arrive in the same read chunk as NEWKEYS, so these parameters MUST be
@@ -676,6 +705,7 @@ export class SSHSession {
             : undefined
         );
 
+        if (this.closed) return;
         if (!packet) {
           this.sendDebug(
             () => `No more packets, buffer remaining: ${this.packetParser.getBufferLength()}`
@@ -720,6 +750,11 @@ export class SSHSession {
     }
     if (msgType === SSH_MSG_REQUEST_SUCCESS || msgType === SSH_MSG_REQUEST_FAILURE) {
       // Response to our global request (e.g., keepalive)
+      if (this.keepalivePending && this.keepaliveSentAt !== null) {
+        const latency = Math.round(performance.now() - this.keepaliveSentAt);
+        this.keepaliveSentAt = null;
+        this.emitKeepaliveRtt(latency);
+      }
       this.keepalivePending = false;
       this.keepaliveFailCount = 0;
       if (this.keepaliveTimeout) {
@@ -790,6 +825,18 @@ export class SSHSession {
     }
   }
 
+  private emitKeepaliveRtt(latency: number): void {
+    if (latency < 0) return;
+    this.onRttUpdated?.(latency, this.colo);
+    if (this.ownsWebSocket && !this.isDetached() && this.ws.readyState === WebSocket.OPEN) {
+      try {
+        this.ws.send(JSON.stringify({ type: 'rtt', latency, colo: this.colo }));
+      } catch {
+        /* 发送失败忽略 */
+      }
+    }
+  }
+
   private startKeepalive(): void {
     this.keepaliveFailCount = 0;
     this.keepalivePending = false;
@@ -812,6 +859,7 @@ export class SSHSession {
         payload.set(KEEPALIVE_REQUEST_NAME, 5);
         payload[5 + KEEPALIVE_REQUEST_NAME.length] = 1; // want_reply = true
 
+        this.keepaliveSentAt = performance.now();
         await this.sendEncrypted(payload);
         this.keepalivePending = true;
 
@@ -823,6 +871,7 @@ export class SSHSession {
               `Keepalive response timeout (${this.keepaliveFailCount}/${this.maxKeepaliveFails})`
             );
             this.keepalivePending = false;
+            this.keepaliveSentAt = null;
             if (this.keepaliveFailCount >= this.maxKeepaliveFails) {
               this.sendError('SSH 连接超时，保活失败', 'keepalive_timeout');
               this.close();
@@ -831,6 +880,8 @@ export class SSHSession {
         }, 10000);
       } catch (e) {
         this.keepaliveFailCount++;
+        this.keepalivePending = false;
+        this.keepaliveSentAt = null;
         this.sendDebug(
           `Keepalive send failed (${this.keepaliveFailCount}/${this.maxKeepaliveFails}): ${e instanceof Error ? e.message : String(e)}`
         );
@@ -866,7 +917,7 @@ export class SSHSession {
       }
       if (this.idleTimeoutMs > 0 && this.isReady() && this.ownsWebSocket && !this.isDetached()) {
         // AI Agent 执行保护：只要 Agent 仍处于运行状态，视作用户委托任务进行中，自动维持连接
-        if (this.agentCore?.getStatus() === 'running') {
+        if (this.agentCore?.getStatus() === 'running' && !this.pendingAgentConfirmation) {
           this.recordUserActivity();
           return;
         }
@@ -916,6 +967,11 @@ export class SSHSession {
             filterExtInfo(serverKex.kexAlgorithms),
             'KEX algorithm'
           );
+          this.negotiatedHostKeyAlgorithm = negotiate(
+            clientKex.hostKeyAlgorithms,
+            serverKex.hostKeyAlgorithms,
+            'host key algorithm'
+          );
           this.negotiatedCipherC2S = negotiate(
             clientKex.encryptionC2S,
             serverKex.encryptionC2S,
@@ -941,13 +997,13 @@ export class SSHSession {
                 'S2C MAC'
               );
           this.sendDebug(
-            `Negotiated KEX: ${this.negotiatedKexAlgorithm}, C2S: ${this.negotiatedCipherC2S}/${this.negotiatedMacC2S}, S2C: ${this.negotiatedCipherS2C}/${this.negotiatedMacS2C}`
+            `Negotiated KEX: ${this.negotiatedKexAlgorithm}, HostKey: ${this.negotiatedHostKeyAlgorithm}, C2S: ${this.negotiatedCipherC2S}/${this.negotiatedMacC2S}, S2C: ${this.negotiatedCipherS2C}/${this.negotiatedMacS2C}`
           );
           await this.sendKEXECDHInit();
         } catch (e) {
           const errMsg = e instanceof Error ? e.message : String(e);
           this.sendError(`算法协商失败: ${errMsg}`, 'algorithm_error', { message: errMsg });
-          this.close();
+          this.close(true);
         }
         break;
       }
@@ -1012,6 +1068,11 @@ export class SSHSession {
         filterExtInfo(serverKex.kexAlgorithms),
         'KEX algorithm'
       );
+      this.negotiatedHostKeyAlgorithm = negotiate(
+        clientKex.hostKeyAlgorithms,
+        serverKex.hostKeyAlgorithms,
+        'host key algorithm'
+      );
       this.negotiatedCipherC2S = negotiate(
         clientKex.encryptionC2S,
         serverKex.encryptionC2S,
@@ -1037,7 +1098,7 @@ export class SSHSession {
             'S2C MAC'
           );
       this.sendDebug(
-        `Rekey negotiated KEX: ${this.negotiatedKexAlgorithm}, C2S: ${this.negotiatedCipherC2S}/${this.negotiatedMacC2S}, S2C: ${this.negotiatedCipherS2C}/${this.negotiatedMacS2C}`
+        `Rekey negotiated KEX: ${this.negotiatedKexAlgorithm}, HostKey: ${this.negotiatedHostKeyAlgorithm}, C2S: ${this.negotiatedCipherC2S}/${this.negotiatedMacC2S}, S2C: ${this.negotiatedCipherS2C}/${this.negotiatedMacS2C}`
       );
 
       // 3. 生成并发送 ECDH Init（在当前活跃密钥下加密发送）
@@ -1045,7 +1106,8 @@ export class SSHSession {
     } catch (e) {
       const errMsg = e instanceof Error ? e.message : String(e);
       this.sendDebug(`Rekey algorithm negotiation failed: ${errMsg}`);
-      this.finishRekey();
+      this.sendError(`算法协商失败: ${errMsg}`, 'algorithm_error', { message: errMsg });
+      this.close(true);
     }
   }
 
@@ -1130,6 +1192,19 @@ export class SSHSession {
       `ECDH_REPLY parsed: hostKey=${hostKey.length}, serverPubKey=${serverRawPublicKey.length}, sig=${signature.length}`
     );
 
+    let presentedKey: PresentedHostKey;
+    try {
+      if (!this.negotiatedHostKeyAlgorithm) throw new Error('Host key algorithm not negotiated');
+      assertHostKeyAlgorithm(this.negotiatedHostKeyAlgorithm, hostKey, signature);
+      presentedKey = await parsePresentedHostKey(hostKey);
+    } catch (error) {
+      this.sendDebug(`Host key rejected: ${error instanceof Error ? error.message : 'invalid key'}`);
+      this.sendError('主机密钥或证书无效，连接已终止', 'host_key_invalid');
+      this.close(true);
+      return;
+    }
+    if (this.closed) return;
+
     if (!this.negotiatedKexAlgorithm || !this.kexRawPublicKey) {
       throw new Error('KEX reply received before KEX init was sent');
     }
@@ -1182,61 +1257,45 @@ export class SSHSession {
       .join('');
     this.sendDebug(`Exchange hash H=${hHex}`);
 
-    // Extract host key algorithm type from the blob
+    if (this.closed) return;
+    // H above deliberately contains the ORIGINAL certificate, not the normalized raw key.
+    // Certificates never inherit the legacy signature-verification escape hatch.
+    const requireSignature = this.strictHostKeyVerify || presentedKey.certificate;
+    let sigVerified = false;
     try {
-      const ktLen = (hostKey[0] << 24) | (hostKey[1] << 16) | (hostKey[2] << 8) | hostKey[3];
-      this.hostKeyType = this.textDecoder.decode(hostKey.subarray(4, 4 + ktLen));
-    } catch {
-      this.hostKeyType = 'unknown';
-    }
-
-    // Compute host key fingerprint (SHA-256)
-    const fpHash = new Uint8Array(await crypto.subtle.digest('SHA-256', hostKey));
-    this.hostKeyFingerprint = `SHA256:${btoa(String.fromCharCode(...fpHash)).replace(/=+$/, '')}`;
-    this.sendDebug(`Host key fingerprint: ${this.hostKeyFingerprint} (${this.hostKeyType})`);
-
-    // Verify possession of the presented host key before comparing or persisting its fingerprint.
-    let sigVerified: boolean | null = false;
-    try {
-      sigVerified = await this.verifyHostKeySignature(hostKey, signature, H);
-      if (sigVerified === null) {
-        this.sendDebug('Host key signature verification: UNSUPPORTED ALGORITHM');
-        if (this.strictHostKeyVerify) {
-          this.sendError('主机密钥签名验证失败：不支持的密钥算法', 'host_key_unsupported');
-          this.close();
+      sigVerified = await verifySSHSignature(presentedKey.publicKeyBlob, signature, H);
+      if (this.closed) return;
+      this.sendDebug(`Host key signature verification: ${sigVerified ? 'PASS' : 'FAIL'}`);
+      if (!sigVerified) {
+        if (requireSignature) {
+          this.sendError('主机密钥签名验证失败，连接已终止', 'host_key_invalid');
+          this.close(true);
           return;
         }
-        this.sendStatus('主机密钥签名验证被跳过（暂不支持该算法）', 'host_key_verify_skipped');
-      } else {
-        this.sendDebug(`Host key signature verification: ${sigVerified ? 'PASS' : 'FAIL'}`);
-        if (!sigVerified) {
-          if (this.strictHostKeyVerify) {
-            this.sendError(
-              '主机密钥签名验证失败，连接被阻断。如需跳过，请设置 STRICT_HOST_KEY_VERIFY=false',
-              'host_key_signature_blocked'
-            );
-            this.close();
-            return;
-          }
-          this.sendError(
-            '主机密钥签名验证失败 - 可能会有安全风险，但不阻断连接（严格模式已关闭）',
-            'host_key_signature_risk'
-          );
-        }
+        this.sendError(
+          '主机密钥签名验证失败 - 可能会有安全风险，但不阻断连接（严格模式已关闭）',
+          'host_key_signature_risk'
+        );
       }
-    } catch (e) {
-      const errMsg = e instanceof Error ? e.message : String(e);
-      this.sendDebug(`Signature verification error: ${errMsg}`);
-      if (this.strictHostKeyVerify) {
-        this.sendError(`主机密钥签名验证异常: ${errMsg}`, 'host_key_signature_error', {
-          message: errMsg,
-        });
-        this.close();
+    } catch (error) {
+      this.sendDebug(`Signature verification error: ${error instanceof Error ? error.message : 'invalid signature'}`);
+      if (requireSignature) {
+        this.sendError('主机密钥或证书无效，连接已终止', 'host_key_invalid');
+        this.close(true);
         return;
       }
     }
-
-    if (!this.finalizeHostKeyTrust(sigVerified === true)) return;
+    if (this.closed) return;
+    this.hostKeyType = presentedKey.keyType;
+    this.hostKeyFingerprint = await fingerprintHostKey(presentedKey.publicKeyBlob);
+    if (this.closed || !this.finalizeHostKeyTrust(sigVerified)) return;
+    this.acceptedHostKeyFingerprint ??= this.hostKeyFingerprint;
+    if (sigVerified) {
+      this.sendDebug(`Host key fingerprint: ${this.hostKeyFingerprint} (${this.hostKeyType})`);
+    }
+    if (presentedKey.certificate && !this.isRekeying) {
+      this.sendStatus('主机证书使用公钥指纹 TOFU 验证，未信任签发 CA', 'host_key_certificate_tofu');
+    }
 
     if (!this.sessionID) {
       this.sessionID = H;
@@ -1248,7 +1307,7 @@ export class SSHSession {
     const macC2S = getMacSpec(this.negotiatedMacC2S);
     const macS2C = getMacSpec(this.negotiatedMacS2C);
 
-    this.derivedKeys = await KeyDerivation.deriveKeys(
+    const derivedKeys = await KeyDerivation.deriveKeys(
       sharedSecret,
       H,
       this.sessionID!,
@@ -1257,6 +1316,8 @@ export class SSHSession {
       macC2S.keyLength,
       macS2C.keyLength
     );
+    if (this.closed) return;
+    this.derivedKeys = derivedKeys;
     this.sendDebug('Keys derived, waiting for NEWKEYS');
   }
 
@@ -1265,6 +1326,12 @@ export class SSHSession {
    */
   private finalizeHostKeyTrust(signatureVerified: boolean): boolean {
     if (this.isRekeying) {
+      // Renewal may change certificate metadata, but never silently replace the pinned host key.
+      if (this.acceptedHostKeyFingerprint !== this.hostKeyFingerprint) {
+        this.sendError('主机密钥指纹变更，重协商已终止', 'host_key_changed');
+        this.close(true);
+        return false;
+      }
       return true;
     }
     const expectedFingerprint = this.config.expectedFingerprint;
@@ -1362,178 +1429,6 @@ export class SSHSession {
     return true;
   }
 
-  private async verifyHostKeySignature(
-    hostKeyBlob: Uint8Array,
-    signatureBlob: Uint8Array,
-    exchangeHash: Uint8Array
-  ): Promise<boolean | null> {
-    // Parse host key blob to get key type and raw key
-    let offset = 0;
-    const keyTypeLen =
-      (hostKeyBlob[offset] << 24) |
-      (hostKeyBlob[offset + 1] << 16) |
-      (hostKeyBlob[offset + 2] << 8) |
-      hostKeyBlob[offset + 3];
-    offset += 4;
-    const keyType = this.textDecoder.decode(hostKeyBlob.subarray(offset, offset + keyTypeLen));
-    offset += keyTypeLen;
-    this.sendDebug(`Host key type: ${keyType}`);
-
-    // Parse signature blob to get sig type and raw sig
-    let sigOffset = 0;
-    const sigTypeLen =
-      (signatureBlob[sigOffset] << 24) |
-      (signatureBlob[sigOffset + 1] << 16) |
-      (signatureBlob[sigOffset + 2] << 8) |
-      signatureBlob[sigOffset + 3];
-    sigOffset += 4;
-    const sigType = this.textDecoder.decode(
-      signatureBlob.subarray(sigOffset, sigOffset + sigTypeLen)
-    );
-    sigOffset += sigTypeLen;
-    const rawSigLen =
-      (signatureBlob[sigOffset] << 24) |
-      (signatureBlob[sigOffset + 1] << 16) |
-      (signatureBlob[sigOffset + 2] << 8) |
-      signatureBlob[sigOffset + 3];
-    sigOffset += 4;
-    const rawSig = signatureBlob.subarray(sigOffset, sigOffset + rawSigLen);
-    this.sendDebug(`Signature type: ${sigType}, raw sig len: ${rawSig.length}`);
-
-    if (keyType === 'ssh-ed25519') {
-      const rawKeyLen =
-        (hostKeyBlob[offset] << 24) |
-        (hostKeyBlob[offset + 1] << 16) |
-        (hostKeyBlob[offset + 2] << 8) |
-        hostKeyBlob[offset + 3];
-      offset += 4;
-      const rawKey = hostKeyBlob.subarray(offset, offset + rawKeyLen);
-      this.sendDebug(`Ed25519 public key: ${rawKey.length} bytes`);
-
-      const pubKey = await crypto.subtle.importKey('raw', rawKey, { name: 'Ed25519' }, false, [
-        'verify',
-      ]);
-
-      return await crypto.subtle.verify('Ed25519', pubKey, rawSig, exchangeHash);
-    } else if (
-      keyType === 'ecdsa-sha2-nistp256' ||
-      keyType === 'ecdsa-sha2-nistp384' ||
-      keyType === 'ecdsa-sha2-nistp521'
-    ) {
-      // RFC 5656: ECDSA 主机密钥按曲线 exhaustive 支持
-      let namedCurve: string;
-      let hash: 'SHA-256' | 'SHA-384' | 'SHA-512';
-      let coordBytes: number;
-      switch (keyType) {
-        case 'ecdsa-sha2-nistp256':
-          namedCurve = 'P-256';
-          hash = 'SHA-256';
-          coordBytes = 32;
-          break;
-        case 'ecdsa-sha2-nistp384':
-          namedCurve = 'P-384';
-          hash = 'SHA-384';
-          coordBytes = 48;
-          break;
-        case 'ecdsa-sha2-nistp521':
-          namedCurve = 'P-521';
-          hash = 'SHA-512';
-          coordBytes = 66;
-          break;
-        default:
-          throw new Error(`unsupported ECDSA host key: ${keyType}`);
-      }
-
-      // Parse ECDSA key blob: string(curve), string(point)
-      const curveLen =
-        (hostKeyBlob[offset] << 24) |
-        (hostKeyBlob[offset + 1] << 16) |
-        (hostKeyBlob[offset + 2] << 8) |
-        hostKeyBlob[offset + 3];
-      offset += 4 + curveLen;
-      const rawKeyLen =
-        (hostKeyBlob[offset] << 24) |
-        (hostKeyBlob[offset + 1] << 16) |
-        (hostKeyBlob[offset + 2] << 8) |
-        hostKeyBlob[offset + 3];
-      offset += 4;
-      const rawKey = hostKeyBlob.subarray(offset, offset + rawKeyLen);
-      this.sendDebug(`ECDSA public key: ${rawKey.length} bytes, curve=${namedCurve}`);
-
-      const pubKey = await crypto.subtle.importKey(
-        'raw',
-        rawKey,
-        { name: 'ECDSA', namedCurve },
-        false,
-        ['verify']
-      );
-
-      // Convert SSH (r||s) signature to raw r||s for Web Crypto（按曲线坐标长度 pad）
-      const ecdsaRawSig = convertSSHECDSASig(rawSig, coordBytes);
-      this.sendDebug(`ECDSA raw sig: ${ecdsaRawSig.length} bytes`);
-
-      return await crypto.subtle.verify({ name: 'ECDSA', hash }, pubKey, ecdsaRawSig, exchangeHash);
-    } else if (keyType === 'ssh-rsa') {
-      // Parse RSA key
-      const eLen =
-        (hostKeyBlob[offset] << 24) |
-        (hostKeyBlob[offset + 1] << 16) |
-        (hostKeyBlob[offset + 2] << 8) |
-        hostKeyBlob[offset + 3];
-      offset += 4;
-      const eRaw = hostKeyBlob.subarray(offset, offset + eLen);
-      offset += eLen;
-
-      const nLen =
-        (hostKeyBlob[offset] << 24) |
-        (hostKeyBlob[offset + 1] << 16) |
-        (hostKeyBlob[offset + 2] << 8) |
-        hostKeyBlob[offset + 3];
-      offset += 4;
-      const nRaw = hostKeyBlob.subarray(offset, offset + nLen);
-
-      // Determine hash algorithm based on signature type (RFC 8332)
-      let hashAlgo: 'SHA-256' | 'SHA-512' | 'SHA-1';
-      if (sigType === 'rsa-sha2-256') hashAlgo = 'SHA-256';
-      else if (sigType === 'rsa-sha2-512') hashAlgo = 'SHA-512';
-      else if (sigType === 'ssh-rsa') hashAlgo = 'SHA-1';
-      else {
-        this.sendDebug(`Unknown RSA signature type: ${sigType}`);
-        return false;
-      }
-
-      this.sendDebug(
-        `RSA public key: n=${nRaw.length} bytes, e=${eRaw.length} bytes, sigType=${sigType}, hash=${hashAlgo}`
-      );
-
-      // Convert to JWK format for import
-      const jwk = {
-        kty: 'RSA',
-        e: base64UrlEncodeUnsigned(eRaw),
-        n: base64UrlEncodeUnsigned(nRaw),
-        ext: true,
-      };
-
-      try {
-        const pubKey = await crypto.subtle.importKey(
-          'jwk',
-          jwk,
-          { name: 'RSASSA-PKCS1-v1_5', hash: hashAlgo },
-          false,
-          ['verify']
-        );
-
-        return await crypto.subtle.verify('RSASSA-PKCS1-v1_5', pubKey, rawSig, exchangeHash);
-      } catch (e) {
-        this.sendDebug(`RSA import/verify error: ${e}`);
-        return false;
-      }
-    }
-
-    this.sendDebug(`Unsupported key type for verification: ${keyType}`);
-    return null; // Return null for unsupported algorithms instead of failing
-  }
-
   private async enableEncryption(): Promise<void> {
     const keys = this.derivedKeys!;
     const cipherC2S = getCipherSpec(this.negotiatedCipherC2S);
@@ -1595,6 +1490,8 @@ export class SSHSession {
   }
 
   private canUseAuthMethod(method: ActiveAuthMethod): boolean {
+    // Explicit none mode must never send credentials or start interactive auth.
+    if (this.config.authMethod === 'none') return method === 'none';
     switch (method) {
       case 'none':
         return true;
@@ -1604,7 +1501,13 @@ export class SSHSession {
           Boolean(this.config.privateKey && this.sessionID)
         );
       case 'password':
-        return this.config.authMethod !== 'publickey' && Boolean(this.config.password);
+        if (this.config.authMethod === 'publickey') {
+          // Only an advertised additional factor may prompt after partial success.
+          // Intermediate hops and shared sessions cannot surface authentication prompts.
+          return this.partialAuthenticationStages > 0 && this.allowKeyboardInteractive &&
+            this.config.sessionPolicy?.source !== 'share';
+        }
+        return typeof this.config.password === 'string';
       case 'keyboard-interactive':
         // 分享会话不能把所有者保存的密码交由接收者决定如何响应远端挑战。
         return this.allowKeyboardInteractive && this.config.sessionPolicy?.source !== 'share';
@@ -1632,6 +1535,12 @@ export class SSHSession {
         );
         break;
       case 'password':
+        if (this.config.authMethod === 'publickey') {
+          this.activeAuthMethod = method;
+          this.attemptedAuthMethods.add(method);
+          this.interactiveAuth.requestPasswordFactor();
+          return true;
+        }
         authRequest = SSHAuth.buildPasswordAuthRequest(this.config.username, this.config.password);
         break;
       case 'keyboard-interactive':
@@ -1653,7 +1562,7 @@ export class SSHSession {
   ): ActiveAuthMethod | null {
     const configuredFirst: ActiveAuthMethod[] =
       this.config.authMethod === 'publickey'
-        ? ['publickey', 'keyboard-interactive']
+        ? ['publickey', 'password', 'keyboard-interactive']
         : ['password', 'keyboard-interactive'];
     // RFC 4252 allows a server to omit the list in a failure response. Keep
     // compatibility with such servers after the harmless "none" probe by
@@ -1769,6 +1678,15 @@ export class SSHSession {
           break;
         }
 
+        if (this.config.authMethod === 'none') {
+          this.failAuthentication(
+            '服务器拒绝无认证（none）登录，请选择服务器支持的认证方式',
+            'auth_none_rejected',
+            true
+          );
+          break;
+        }
+
         this.sendDebug(
           `Authentication failure: allowed=[${allowedMethods.join(',')}], partial=${partialSuccess}`
         );
@@ -1786,14 +1704,14 @@ export class SSHSession {
           // be attempted again (for example keyboard-interactive,publickey).
           this.attemptedAuthMethods.clear();
         } else if (
-          previousMethod === configuredPrimaryMethod &&
-          allowedMethods.includes(configuredPrimaryMethod)
+          (previousMethod === configuredPrimaryMethod || previousMethod === 'password') &&
+          allowedMethods.includes(previousMethod)
         ) {
           // The configured credential was rejected and the server still
           // offers the same method. Do not reinterpret that rejection as an
           // interactive challenge merely because keyboard-interactive is
           // also advertised.
-          this.sendDebug(`Configured authentication method rejected: ${configuredPrimaryMethod}`);
+          this.sendDebug(`Credential authentication method rejected: ${previousMethod}`);
           this.failAuthentication(undefined, 'auth_failed', true);
           break;
         }
@@ -2024,13 +1942,7 @@ export class SSHSession {
           if (this.isDetached()) {
             this.handleDetachedTerminalOutput(outputData, channel);
           } else {
-            try {
-              this.ws.send(outputData);
-            } catch (e) {
-              this.sendDebug(
-                () => `Send shell output failed: ${e instanceof Error ? e.message : e}`
-              );
-            }
+            if (!this.forwardTerminalOutput(outputData)) return;
             this.recordShareTerminalOutput(outputData);
             this.queueLocalWindowAdjust(outputData.length, channel);
           }
@@ -2084,13 +1996,7 @@ export class SSHSession {
           if (this.isDetached()) {
             this.handleDetachedTerminalOutput(stderrData, channel);
           } else {
-            try {
-              this.ws.send(stderrData);
-            } catch (e) {
-              this.sendDebug(
-                () => `Send stderr output failed: ${e instanceof Error ? e.message : e}`
-              );
-            }
+            if (!this.forwardTerminalOutput(stderrData)) return;
             this.recordShareTerminalOutput(stderrData);
             this.queueLocalWindowAdjust(stderrData.length, channel);
           }
@@ -2279,6 +2185,12 @@ export class SSHSession {
         }
         if (parsed.type === 'auth_cancel') {
           this.handleKeyboardInteractiveCancel(parsed);
+          return;
+        }
+        if (parsed.type === 'terminal_output_ack') {
+          if (!this.closed && !this.isDetached()) {
+            this.terminalOutputGuard.acknowledge(parsed.id, parsed.bytes);
+          }
           return;
         }
         if (parsed.type === 'ping') {
@@ -3051,10 +2963,7 @@ export class SSHSession {
 
     if (this.agentCore?.getStatus() === 'running') {
       if (supersede) {
-        if (this.confirmationResolve) {
-          this.confirmationResolve(false);
-          this.confirmationResolve = null;
-        }
+        this.finishAgentConfirmation(false);
         this.agentCore.agentAbort('superseded');
       } else {
         this.sendAgentFrame({
@@ -3073,84 +2982,7 @@ export class SSHSession {
       const gid = this.githubId;
       const env = this.env;
       if (serverId && uid && gid && env) {
-        memoryProvider = {
-          fetchUnifiedMemory: async () => {
-            try {
-              const stub = env.USER_DB.get(env.USER_DB.idFromName(gid));
-              const res = await stub.fetch(
-                new Request(`http://internal/internal/servers/${serverId}/memory?user_id=${uid}`)
-              );
-              if (!res.ok) return { workLogs: [], knowledge: [] };
-              return (await res.json()) as UnifiedServerMemory;
-            } catch {
-              return { workLogs: [], knowledge: [] };
-            }
-          },
-          saveBatchMemory: async (batch) => {
-            try {
-              const stub = env.USER_DB.get(env.USER_DB.idFromName(gid));
-              await stub.fetch(
-                new Request(`http://internal/internal/servers/${serverId}/memory/batch`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ user_id: Number(uid), ...batch }),
-                })
-              );
-            } catch {
-              /* ignore */
-            }
-          },
-          beginSession: async (context) => {
-            try {
-              const stub = env.USER_DB.get(env.USER_DB.idFromName(gid));
-              await stub.fetch(
-                new Request(`http://internal/internal/servers/${serverId}/agent-session`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ user_id: Number(uid), ...context }),
-                })
-              );
-            } catch {
-              /* ignore */
-            }
-          },
-          saveTaskCheckpoint: async (checkpoint, context) => {
-            try {
-              const stub = env.USER_DB.get(env.USER_DB.idFromName(gid));
-              await stub.fetch(
-                new Request(`http://internal/internal/servers/${serverId}/agent-checkpoint`, {
-                  method: 'POST',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ user_id: Number(uid), checkpoint, ...context }),
-                })
-              );
-            } catch {
-              /* ignore */
-            }
-          },
-          fetchTaskCheckpoint: async (taskId) => {
-            const stub = env.USER_DB.get(env.USER_DB.idFromName(gid));
-            const res = await stub.fetch(
-              new Request(`http://internal/internal/servers/${serverId}/agent-checkpoint?user_id=${uid}&task_id=${taskId}`)
-            );
-            if (!res.ok) throw new Error('Checkpoint not found');
-            return (await res.json()) as AgentTaskCheckpoint;
-          },
-          deleteTaskCheckpoint: async (taskId, context) => {
-            try {
-              const stub = env.USER_DB.get(env.USER_DB.idFromName(gid));
-              await stub.fetch(
-                new Request(`http://internal/internal/servers/${serverId}/agent-checkpoint`, {
-                  method: 'DELETE',
-                  headers: { 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ user_id: Number(uid), taskId, ...context }),
-                })
-              );
-            } catch {
-              /* ignore */
-            }
-          },
-        };
+        memoryProvider = createAgentMemoryProvider(env, gid, uid, serverId);
       }
 
       this.agentCore = new AgentCore(
@@ -3159,7 +2991,8 @@ export class SSHSession {
         async (uId: string) => this.fetchAgentAIConfig(uId, this.githubId!),
         async (command: string, timeout: number, signal?: AbortSignal) =>
           this.executeAgentCommand(command, timeout, signal),
-        async (command: string, reason: string) => this.askAgentConfirmation(command, reason),
+        async (command: string, reason: string, signal?: AbortSignal) =>
+          this.askAgentConfirmation(command, reason, signal),
         undefined,
         memoryProvider,
         this.waitUntil
@@ -3182,27 +3015,23 @@ export class SSHSession {
    * 这些消息由 durable-object.ts 在调用 handleWebSocketMessage 之前提前路由。
    */
   handleAgentControl(type: string, msg: any): void {
-    this.recordUserActivity();
     if (type === 'agent_confirm') {
-      if (this.confirmationResolve) {
-        this.confirmationResolve(msg.approved === true);
-        this.confirmationResolve = null;
+      const pending = this.pendingAgentConfirmation;
+      if (pending && msg.confirmationId === pending.id && msg.command === pending.command &&
+        typeof msg.approved === 'boolean') {
+        this.recordUserActivity();
+        this.finishAgentConfirmation(msg.approved);
       }
       return;
     }
+    this.recordUserActivity();
     if (type === 'agent_stop') {
-      if (this.confirmationResolve) {
-        this.confirmationResolve(false);
-        this.confirmationResolve = null;
-      }
+      this.finishAgentConfirmation(false);
       this.agentCore?.agentAbort('user_stopped');
       return;
     }
     if (type === 'agent_reset') {
-      if (this.confirmationResolve) {
-        this.confirmationResolve(false);
-        this.confirmationResolve = null;
-      }
+      this.finishAgentConfirmation(false);
       this.agentCore?.resetSession();
       this.sendAgentFrame({
         type: 'agent_frame',
@@ -3363,19 +3192,34 @@ export class SSHSession {
     });
   }
 
-  /**
-   * 等待用户确认/取消。DO 防 Hibernate 由 AgentCore.runLoopKeepAlive 统一保活，
-   * 此处只需注册 resolve 回调即可。
-   */
-  private askAgentConfirmation(command: string, reason: string): Promise<boolean> {
+  /** Waiting is not active execution: user inactivity continues to expire it. */
+  private askAgentConfirmation(
+    command: string, reason: string, signal?: AbortSignal
+  ): Promise<boolean> {
+    if (this.closed || signal?.aborted) return Promise.resolve(false);
+    this.finishAgentConfirmation(false);
+    this.recordUserActivity(); // Start the waiting budget once, never on watchdog ticks.
     return new Promise((resolve) => {
-      this.confirmationResolve = resolve;
+      const id = crypto.randomUUID();
+      const onAbort = () => {
+        if (this.pendingAgentConfirmation?.id === id) this.finishAgentConfirmation(false);
+      };
+      this.pendingAgentConfirmation = { id, command, resolve, signal, onAbort };
+      signal?.addEventListener('abort', onAbort, { once: true });
       this.sendAgentFrame({
-        type: 'agent_frame',
-        subType: 'confirm_required',
-        command,
-        reason,
+        type: 'agent_frame', subType: 'confirm_required', confirmationId: id, command, reason,
       });
+    });
+  }
+
+  private finishAgentConfirmation(approved: boolean): void {
+    const pending = this.pendingAgentConfirmation;
+    if (!pending) return;
+    this.pendingAgentConfirmation = null;
+    pending.signal?.removeEventListener('abort', pending.onAbort);
+    pending.resolve(approved);
+    this.sendAgentFrame({
+      type: 'agent_frame', subType: 'confirm_closed', confirmationId: pending.id,
     });
   }
 
@@ -3405,10 +3249,46 @@ export class SSHSession {
   private sendAgentFrame(msg: any): void {
     try {
       if (this.ws.readyState === WebSocket.OPEN) {
-        this.ws.send(JSON.stringify(msg));
+        let frame = msg;
+        if (msg.diagnostics) {
+          this.sendDebug(() => responseErrorDebugMessage(msg.errorCode ?? msg.code, msg.status, msg.diagnostics));
+          const { purpose } = normalizeResponseDiagnostics(msg.diagnostics);
+          // Keep only the purpose needed for checkpoint pause copy in the normal UI channel.
+          frame = { ...msg, diagnostics: purpose ? { purpose } : undefined };
+        }
+        this.ws.send(JSON.stringify(frame));
       }
     } catch {
       /* WebSocket 已关闭，无法送达 */
+    }
+  }
+
+  private closeForOutputBacklog(): void {
+    if (this.closed) return;
+    try {
+      this.sendError('终端输出积压或客户端确认超时，连接已关闭', 'output_backlog_closed');
+    } finally {
+      // Normal close prevents automatic reconnect from restarting noisy commands.
+      this.close(true);
+    }
+  }
+
+  private forwardTerminalOutput(data: Uint8Array): boolean {
+    if (this.closed) return false;
+    if (!this.terminalOutputGuard.reserve(data.byteLength)) {
+      this.closeForOutputBacklog();
+      return false;
+    }
+    try {
+      if (!this.outputFlowAnnounced) {
+        this.ws.send(JSON.stringify({ type: 'terminal_output_flow', id: this.terminalOutputGuard.id }));
+        this.outputFlowAnnounced = true;
+      }
+      this.ws.send(data);
+      return true;
+    } catch {
+      this.closeForOutputBacklog();
+      return false;
     }
   }
 
@@ -3422,6 +3302,10 @@ export class SSHSession {
 
   public setDetached(detached: boolean): void {
     if (this.detachedBuffer.setDetached(detached)) {
+      if (detached) {
+        this.terminalOutputGuard.reset();
+        this.outputFlowAnnounced = false;
+      }
       if (detached && this.config.sessionPolicy?.source === 'share') {
         void this.writeShareAudit('session.detached', {
           detachedAt: Date.now(),
@@ -3477,6 +3361,8 @@ export class SSHSession {
   ): Promise<void> {
     this.recordUserActivity();
     this.ws = newWs;
+    this.terminalOutputGuard.reset();
+    this.outputFlowAnnounced = false;
     this.detachedBuffer.setDetached(false);
 
     // 恢复 SFTP attach URL（若断线期间丢失），保证恢复后可重建 SFTP 数据通道
@@ -3500,6 +3386,9 @@ export class SSHSession {
     // 重发双段延迟基线：上游 SSH 连接未重建，原 CF→源站基线仍有效；
     // 客户端↔CF 段由心跳即时探测补齐
     if (credentials?.baseline) {
+      if (credentials.baseline.colo) {
+        this.colo = credentials.baseline.colo;
+      }
       try {
         this.ws.send(
           JSON.stringify({
@@ -3516,11 +3405,7 @@ export class SSHSession {
     // 2. 补发断线期间暂存的输出数据
     const chunks = this.detachedBuffer.drainOutput();
     for (const chunk of chunks) {
-      try {
-        this.ws.send(chunk);
-      } catch {
-        /* 发送失败不中断补发流程 */
-      }
+      if (!this.forwardTerminalOutput(chunk)) return;
     }
 
     // 3. 恢复因背压积压的 Window 额度
@@ -3545,6 +3430,9 @@ export class SSHSession {
   close(normal: boolean = false): void {
     if (this.closed) return;
     this.closed = true;
+    this.packetParser.clear();
+    this.versionRawBuffer = new Uint8Array(0);
+    this.terminalOutputGuard.dispose();
     this.detachedBuffer.clear();
     this.notifyShareSessionClosed(normal);
     if (!this.authenticatedSettled) {
@@ -3565,6 +3453,8 @@ export class SSHSession {
       clearTimeout(this.keepaliveTimeout);
       this.keepaliveTimeout = null;
     }
+    this.keepalivePending = false;
+    this.keepaliveSentAt = null;
     if (this.idleWatchdogInterval) {
       clearInterval(this.idleWatchdogInterval);
       this.idleWatchdogInterval = null;
@@ -3605,10 +3495,7 @@ export class SSHSession {
       for (const wake of waiters) wake();
     }
     this.channelWindowWaiters.clear();
-    if (this.confirmationResolve) {
-      this.confirmationResolve(false);
-      this.confirmationResolve = null;
-    }
+    this.finishAgentConfirmation(false);
     this.channels.clear();
     this.channelDataQueue = [];
     this.channelDataQueueHead = 0;

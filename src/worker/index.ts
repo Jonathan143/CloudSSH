@@ -26,6 +26,7 @@ import {
   LOCAL_ADMIN_GITHUB_ID,
 } from './auth';
 import { HTML } from './html';
+import { handleVersionCheck } from './version-check';
 
 export { SSHSessionDO } from './durable-object';
 export { SSHShareDO } from './share-do';
@@ -349,6 +350,11 @@ export default {
 
       if (url.pathname === '/api/health') {
         return Response.json({ status: 'ok', timestamp: Date.now() });
+      }
+
+      // Public, cached metadata only; never tied to sessions or user credentials.
+      if (url.pathname === '/api/version') {
+        return handleVersionCheck(request);
       }
 
       // Return config info (includes GitHub auth availability)
@@ -1213,6 +1219,7 @@ async function handleSSHConnection(request: Request, env: Env): Promise<Response
   const headers = new Headers(request.headers);
   headers.set('x-cloudflare-colo', (request as any).cf?.colo || 'UNKNOWN');
   headers.delete('x-ssh-config'); // 防御：禁止匿名连接通过 HTTP 头注入配置
+  headers.delete('x-share-device-key');
 
   return stub.fetch(new Request(doUrl.toString(), { headers }));
 }
@@ -1251,6 +1258,7 @@ async function handleResumeSSHConnection(
   const headers = new Headers(request.headers);
   headers.set('x-cloudflare-colo', (request as any).cf?.colo || 'UNKNOWN');
   headers.delete('x-ssh-config');
+  headers.delete('x-share-device-key');
 
   return stub.fetch(new Request(doUrl.toString(), { headers }));
 }
@@ -1404,8 +1412,9 @@ async function handleShareSSHConnection(
   const headers = new Headers(request.headers);
   headers.set('x-cloudflare-colo', (request as any).cf?.colo || 'UNKNOWN');
   headers.set('x-ssh-config', encodeURIComponent(JSON.stringify(config)));
-  // 认领时绑定的设备公钥由服务端链路下发（claim → ShareDO → consume），
-  // 客户端无法注入或替换，断线恢复时以此验签。
+  // Clear the external header even when claim did not bind a device.
+  // Only claim → ShareDO → consume may supply the authoritative resume key.
+  headers.delete('x-share-device-key');
   if (typeof devicePubKey === 'string' && devicePubKey) {
     headers.set('x-share-device-key', devicePubKey);
   }
@@ -1493,6 +1502,7 @@ async function handleTokenSSHConnection(
   const headers = new Headers(request.headers);
   headers.set('x-cloudflare-colo', (request as any).cf?.colo || 'UNKNOWN');
   headers.set('x-ssh-config', encodeURIComponent(JSON.stringify(config)));
+  headers.delete('x-share-device-key');
 
   const doRequest = new Request(doUrl.toString(), {
     headers: headers,
@@ -1521,5 +1531,8 @@ async function handleSFTPAttachConnection(request: Request, env: Env): Promise<R
 
   const doId = env.SSH_SESSION.idFromName(sessionName);
   const stub = env.SSH_SESSION.get(doId);
-  return stub.fetch(request);
+  const headers = new Headers(request.headers);
+  headers.delete('x-share-device-key');
+  headers.delete('x-ssh-config');
+  return stub.fetch(new Request(request, { headers }));
 }

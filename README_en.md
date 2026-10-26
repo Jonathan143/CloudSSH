@@ -4,6 +4,7 @@
   <p><b>Ultra-lightweight · Out-of-the-box · Cyberpunk UI</b></p>
   <p>
     <a href="https://github.com/newbietan/CloudSSH/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/newbietan/CloudSSH?style=flat&logo=github"></a>
+    <a href="https://afdian.com/a/newbietan" target="_blank"><img alt="Afdian" src="https://img.shields.io/badge/Afdian-Sponsor-946ce6?style=flat&logo=afdian&logoColor=white"></a>
     <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-Apache%202.0-blue.svg"></a>
     <img alt="Cloudflare" src="https://img.shields.io/badge/Cloudflare-F38020?style=flat&logo=cloudflare&logoColor=white">
     <img alt="TypeScript" src="https://img.shields.io/badge/TypeScript-3178C6?style=flat&logo=typescript&logoColor=white">
@@ -16,6 +17,7 @@
     <a href="#architecture">Architecture</a> ·
     <a href="CHANGELOG.md">Changelog</a> ·
     <a href="#contributors">Contributors</a> ·
+    <a href="#sponsor">Sponsor</a> ·
     <a href="#license">License</a>
   </p>
   <p>
@@ -57,6 +59,7 @@
 - [Development](#development)
   - [Local Development](#local-development)
 - [Contributors](#contributors)
+- [Sponsor](#sponsor)
 - [License](#license)
 
 </details>
@@ -78,7 +81,8 @@
 ### Secure and Reliable
 
 - **Two-Segment Encryption**: HTTPS/WSS between browser and Worker; the Worker-to-server segment uses the full SSH-2.0 protocol (Curve25519-SHA256/ECDH-NISTP256 key exchange, AES-256-GCM/CTR encryption, HMAC-SHA2 integrity).
-- **Host-Key Verification**: Ed25519/ECDSA P-256/P-384/P-521/RSA signature checks with a SHA-256 fingerprint on first connection (TOFU).
+- **Host-Key Verification**: Ed25519/ECDSA P-256/P-384/P-521/RSA signature checks with a SHA-256 fingerprint on first connection (TOFU). Ed25519, RSA-SHA2-256/512, and ECDSA P-256/P-384/P-521 OpenSSH host certificates are supported: certificate signatures, lifetimes, host type, and critical restrictions are checked, then the underlying public key verifies the SSH handshake and supplies a stable fingerprint. This remains public-key TOFU: the embedded CA is not automatically trusted, principals are not treated as CA-authorized host identities, and no trusted-CA store is provided. Renewing a certificate keeps the same public-key fingerprint; actual key changes still require explicit confirmation.
+- **Encrypted Keys and MFA**: Browser-local unlocking supports OpenSSH bcrypt/AES-CTR and PKCS#8 PBES2 keys. Passphrases are neither saved nor sent to the Worker; unlocked keys still reach the Worker for SSH signing. Anonymous imports are transient by default, and saving an unlocked key requires separate consent. Public-key authentication may be followed by an explicitly entered password factor; existing OTP challenges remain supported. See [SSH compatibility and interoperability notes](docs/ssh-compatibility.md) for limits and real-server tests.
 - **Defense in Depth**: IPv6/reserved-address SSRF blocking plus DNS-rebinding protection, bounded in-memory rate limiting, Turnstile verification, and AES-256-GCM encryption for saved credentials in per-user SQLite storage.
 - **Session Isolation**: Each terminal session runs in an independent Durable Object; an active outbound SSH TCP connection keeps it awake.
 - **Internal Credential Flow**: On one-click connect, the server decrypts credentials and hands them to the session via a one-time token; the browser never sees the plaintext.
@@ -94,15 +98,15 @@
 - **Multi-Algorithm Key Exchange**: Supports Curve25519-SHA256 (preferred) and ECDH-NISTP256 KEX algorithms, compatible with various SSH servers (including Dropbear).
 - **Reliable Key Transitions and Packet Framing**: Re-evaluates encryption and authentication state for every packet, including servers that return `SSH_MSG_NEWKEYS` and the first encrypted packet in the same TCP chunk.
 - **IPv4/IPv6 Dual Stack**: Full support for both IPv4 and IPv6 address connections, including automatic handling of IPv6 bracket notation.
-- **Multiple Auth Methods**: Supports standard SSH password authentication, multi-round RFC 4256 `keyboard-interactive` authentication, and OpenSSH-format Ed25519, ECDSA P-256/P-384/P-521, and RSA private keys. Interactive authentication supports passwords, OTPs, multiple prompts, and a second factor after public-key authentication. Server prompts appear in a connection-bound safety dialog, and a saved password is substituted only after an explicit user action. RSA uses RSA-SHA2-256/512 by default; legacy `ssh-rsa` SHA-1 is allowed only through explicit compatibility configuration.
+- **Multiple Auth Methods**: Supports standard SSH password authentication, RFC 4252 §5.2 `none` authentication, multi-round RFC 4256 `keyboard-interactive` authentication, and OpenSSH-format Ed25519, ECDSA P-256/P-384/P-521, and RSA private keys. Select **None** to send only a username, without a password or private key. The server must explicitly accept this method; rejection does not fall back to other methods. This is not empty-password login. A username may grant access: keep it secret and note that local connection history stores usernames. Password mode accepts an empty password. When editing a saved password, leaving the field blank keeps the original; select **Set an empty password** to clear it. Interactive authentication supports pressing Enter to submit an empty response, zero-prompt rounds, passwords, OTPs, multiple prompts, and a second factor after public-key authentication. Server prompts appear in a connection-bound safety dialog, and a saved password is substituted only after an explicit user action. RSA uses RSA-SHA2-256/512 by default; legacy `ssh-rsa` SHA-1 is allowed only through explicit compatibility configuration.
 - **SSH Jump Hosts / Bastions**: Signed-in users may select another saved server as a jump host. CloudSSH builds each layer with the standard RFC 4254 `direct-tcpip` channel and does not require `ssh`, `nc`, or `socat` on the remote host. Up to 3 jump hosts are supported; the final target's terminal, SFTP, and AI Agent use the complete encrypted chain. Authentication and path-scoped host-key verification run independently at every hop.
 - **Cloudflare Tunnel (Zero Trust Tunnel)**: Connect directly to intranet servers without public IPs or open ports (homelabs, private LANs) using Cloudflare Tunnel (cloudflared), eliminating the need for a jump host. Leverages the standard WebSocket Carrier architecture to transparently stream SSH binary frames, supporting optional Cloudflare Zero Trust Service Tokens (Client ID / Client Secret). The proprietary SSH stack, TOFU host keys, SFTP, and AI Agent operate seamlessly over the tunnel.
 - **One-Time SSH Access Sharing**: Optionally lets signed-in users share saved servers. The link contains only a 256-bit random capability, never the host, username, password, private key, or jump route. Only its hash is stored; it can be claimed once and has separate claim and session lifetimes. Shared sessions allow the terminal and SFTP while the backend disables AI Agent, OS detection, host-key mutation, and reconnect. Owners can revoke live access and review share-only lifecycle, SFTP, and terminal-output records.
 - **MitM Protection (TOFU)**: Automatically extracts and prints the server's Host Key (SHA-256 fingerprint) on the first connection, supporting Ed25519/ECDSA/RSA signature verification, and caches known host keys locally and via API to prevent MitM on future connections.
 - **Geek Terminal Experience**: Powered by `@xterm/xterm` and the `@xterm/addon-webgl` hardware acceleration rendering engine, ensuring silky smooth scrolling even with massive log outputs.
 - **Reliable Terminal Clipboard Interaction**: Completing a terminal selection with a mouse automatically copies it, and right-click pastes directly. On touch devices, tapping Copy in the shortcut bar enters selection mode; drag across terminal text and tap Copy again to finish, avoiding unreliable long-press selection, while Paste remains a separate action. Paste data follows xterm.js's native input pipeline, emits bracketed-paste control sequences only when the remote application enables that mode, and normalizes line endings for compatibility with Vim and regular shells.
-- **Mobile Terminal Support**: Phones and tablets get dynamic visual-viewport sizing, soft-keyboard and safe-area handling, iOS Chinese IME compatibility, a compact action bar, one-shot Ctrl/Alt, Esc/Tab/arrows/Home/End/PgUp/PgDn shortcuts, and full-screen Agent/SFTP panels. After a page returns from the background, CloudSSH actively validates the WebSocket and replaces connections that only appear open. Anonymous sessions rebuild SSH from the current in-memory credentials, while signed-in saved servers request a fresh one-time connection token; the UI and terminal input return to the connected state only after `shell_ready`. Users may explicitly request fullscreen landscape; unsupported orientation locks fall back to a manual rotation hint without changing desktop layouts. If the mobile OS completely discards the page, the current shell cannot be resumed seamlessly.
-- **Customizable UI & Liquid Segmented Controls**: Theme V4 offers built-in Standard Dark, Standard Light, Cyberpunk, and macOS 26-inspired Liquid Glass themes. The user space header and terminal action bar feature floating glass dynamic islands and liquid segmented controls, integrating SFTP, custom commands, and AI Agent drawers into a unified pill capsule driven by dual-edge asymmetric spring physics with a smooth 3D liquid lens slider for seamless mutually exclusive drawer toggling. V4 adds gradient/mesh background layers (with a readability scrim and a slow drift animation), a scanline/flicker/glow/noise effect registry, an independent surface-blur and saturation tier (`saturate(180%)` + specular inner highlights), and typography scaling, so themes differ far beyond color swaps. The companion [GitHub Pages theme editor](https://newbietan.github.io/CloudSSH/theme-editor/) provides live controls for colors, shape, density, font, shadows, motion, background layers, effects, and button/input/card/tab styles, with previews for login, server list, terminal + SFTP, and the AI Agent panel. The theme segmented bar persistently displays 5 options (4 built-in + 1 Custom), with the standalone upload button removed. Clicking Custom when no theme has been uploaded opens a management modal prompting upload; clicking Custom while already active opens the modal to manage multiple themes (color swatches preview, instant switching, deletion confirmation, up to 20 custom themes). Signed-in users sync their theme library to the cloud for cross-browser restoration, while anonymous users keep them in the current browser only.
+- **Mobile Terminal Support**: Phones and tablets get dynamic visual-viewport sizing, soft-keyboard and dynamic safe-area calculations (`env(safe-area-inset-*)` for notches and Dynamic Island), iOS Chinese IME compatibility, a compact action bar, one-shot Ctrl/Alt, Esc/Tab/arrows/Home/End/PgUp/PgDn shortcuts, and full-screen Agent/SFTP panels. All three side drawers (SFTP, Agent, snippets) support touch right-swipe to close via their headers, avoiding collisions with iOS system edge gestures and vertical scroll contention; touch interactions feature active press-scale feedback without native tap-highlight flash, touch targets expand to ~36px under coarse pointers, and scrollable drawer containers prevent overscroll rubber-banding (`overscroll-behavior-y: contain`). On narrow screens, the AI Agent header and quick prompt chips dynamically wrap and fold to prevent clipping. After a page returns from the background, CloudSSH actively validates the WebSocket and replaces connections that only appear open. Anonymous sessions rebuild SSH from the current in-memory credentials, while signed-in saved servers request a fresh one-time connection token; the UI and terminal input return to the connected state only after `shell_ready`. Users may explicitly request fullscreen landscape; unsupported orientation locks fall back to a manual rotation hint without changing desktop layouts. If the mobile OS completely discards the page, the current shell cannot be resumed seamlessly.
+- **Customizable UI & Liquid Segmented Controls**: Theme V4 offers built-in Standard Dark, Standard Light, Cyberpunk, and macOS 26-inspired Liquid Glass themes. The user space header and terminal action bar feature floating glass dynamic islands and liquid segmented controls, integrating SFTP, custom commands, and AI Agent drawers into a unified pill capsule driven by a shared 1D physics spring engine (`spring.ts`, using Euler numerical integration) with a smooth 3D liquid lens slider for seamless mutually exclusive drawer toggling. Pointer specular spotlights are generalized across all themes (rAF-throttled CSS variable transmission, automatically bypassed on touch devices for power savings), accompanied by staggered card and row entrance animations, cold-loading skeleton screens (with complete ARIA accessibility attributes), global unified `:focus-visible` theme rings, and W3C multi-layer box-shadow syntax compatibility fixes. V4 adds gradient/mesh background layers (with a readability scrim and a slow drift animation), a scanline/flicker/glow/noise effect registry, an independent surface-blur and saturation tier (`saturate(180%)` + specular inner highlights), and typography scaling, with full support for `prefers-reduced-motion` and `data-ui-motion` tiers. The companion [GitHub Pages theme editor](https://newbietan.github.io/CloudSSH/theme-editor/) provides live controls for colors, shape, density, font, shadows, motion, background layers, effects, and button/input/card/tab styles, with previews for login, server list, terminal + SFTP, and the AI Agent panel. The theme segmented bar persistently displays 5 options (4 built-in + 1 Custom), with the standalone upload button removed. Clicking Custom when no theme has been uploaded opens a management modal prompting upload; clicking Custom while already active opens the modal to manage multiple themes (color swatches preview, instant switching, deletion confirmation, up to 20 custom themes). Signed-in users sync their theme library to the cloud for cross-browser restoration, while anonymous users keep them in the current browser only.
 - **SFTP Graphical File Manager**: Integrated with a complete SFTP v3 file transfer protocol, providing a graphical file browser interface. The toolbar features hierarchical path breadcrumbs navigation (click to jump directly to parent directories, click empty space to toggle absolute path text input), and file lists support bidirectional sorting by name, size, and modified time (directories stay pinned to the top). Supports one-click creation of new blank files with automatic CodeMirror editor opening. Supports directory browsing, file upload/download, creating new folders, file renaming, and deletion, plus plain selection, `Cmd/Ctrl` toggle selection, `Shift` range selection, select all, batch file downloads, and batch deletion. Double-clicking files is handled intelligently (text files open directly in the online editor, binary or oversized files automatically route to the serial download queue). Built-in CodeMirror online editor edits remote text files in place (≤2MB; UTF-8 editable, GBK/GB18030 detected as read-only), preserving the original line endings and BOM, with automatic remote-change detection and an explicit overwrite confirmation before saving, as well as line-wrapping preference toggling in the footer. Common configs (shell/YAML/JSON/Python/Markdown/HTML/CSS/Dockerfile/systemd, etc.) get syntax highlighting. Built on the SSH subsystem, it runs alongside terminal sessions without interference and supports download queues and upload cancellation.
 - **Native File Transfer**: Integrated with [trzsz.js](https://github.com/trzsz/trzsz.js), supporting `trz` (upload) / `tsz` (download) commands for file transfer, fully compatible with tmux sessions. Also supports drag-and-drop file upload to the terminal, directory transfer, and resumable transfers. (Requires [trzsz](https://trzsz.github.io/) installed on the remote server)
 - **Multilingual UI**: Ships built-in Simplified Chinese, Traditional Chinese, and English translations, automatically following the browser language with a manual override; the choice is persisted via a URL parameter or local storage (`cloudssh_locale`).
@@ -116,10 +120,11 @@
 - **Smart Region Scheduling (locationHint)**: Queries IPinfo when a direct server is saved, persists the inferred Durable Object region, and reuses it on connection without another runtime geo lookup. With SSH jumps, only the outermost entry reached directly by Cloudflare is inferred; downstream private servers do not trigger a lookup and inherit placement from that entry. Failures fall back to Cloudflare's default placement, and users may manually override direct-entry regions. _Note: automatic inference sends the direct entry's host information to the third-party IPinfo service. locationHint is a Cloudflare best-effort feature and may fall back to a nearby region when capacity is unavailable._
 - **In-Terminal Text Search & Shortcuts**: Real-time log search support via `Ctrl+Shift+F` (or `Cmd+F` on macOS); clear terminal screen and scrollback buffer via `Cmd+K` (macOS) / `Ctrl+Shift+K` (Win/Linux) without conflicting with shell-native `Ctrl+K`.
 - **Terminal Log Export**: Download the entire screen buffer of the active terminal session as a `.txt` file with a single click on the header download button, avoiding browser freezes when selecting long logs.
-- **AI Agent Assistant & Server Memory System**: Built-in AI Agent sidebar with BYOK (Bring Your Own Key) support for stateless Responses APIs (`store: false`), natively compatible with official OpenAI (GPT-4o, o1, o3-mini, etc.) and compatible aggregators implementing the standard Responses specification (such as OpenRouter). Legacy Chat Completions endpoints are not supported. Context history, execution facts, and structured server memory are maintained locally by CloudSSH rather than relying on upstream provider persistence, eliminating remote state leakage and session pollution. The configuration modal features a modern custom Combobox dropdown (full listing, instant fuzzy search, one-click clearing, and multi-theme adaptivity) with secure, token-free model retrieval using stored credentials, fortified by strict Base URL binding against credential exfiltration, same-origin CSRF defense, and sensitive token sanitization. Features Quick Prompt Chips (Analyze Error, System Load, Network Ports, Docker Status) for instant diagnostic prompt insertion with auto-focus. Provides 7 specialized operations tools (execute commands, read terminal context, detect environment, list processes, systemctl management, Docker management, and user confirmation). Supports attaching terminal selections as untrusted context snapshots, one-click code block copying, safe single-line command filling, LLM streaming output, and collapsible thinking process containers with multi-level safety controls.
-  - **Dual-Track Long-Term Memory**: Features accurate time anchoring and user-local timezone conversion (Today, Yesterday, N days ago). Divided into **Work Logs** (rolling activity history that automatically fuses consecutive troubleshooting tasks via `update_latest` to prevent fragmented spam) and **Context Knowledge & Credentials** (automatically distills tokens, passwords, ports, and path configs so future tasks reuse them directly without repeated questioning; backed by key normalization and atomic upserts).
-  - **Decoupled Short/Long-Term Memory**: In-session summaries exclusively track active task goals and unresolved decisions, while persistent server memory archives ops history and configuration entities, eliminating redundant prompt bloat.
-  - **Unobtrusive Drawer UI**: Integrated into a dedicated "Work Logs & Knowledge" drawer panel. Work log cards feature two-line truncation, full-text hover tooltips, and click-to-expand; sensitive credentials are masked by default with one-click visibility toggling, quick copying, and deletion.
+- **AI Operations Assistant & Server Memory**: Use your own key with standard stateless Responses APIs (`store:false`) to deploy, configure, and troubleshoot your servers. Includes streaming replies, quick diagnostic prompts, terminal-selection attachments, code copying, and command filling. Eight tools cover commands, terminal context, environment detection, processes, systemctl, Docker, web reads, and user confirmation. Dangerous commands still require confirmation.
+  - **Reuse Existing Information Directly**: Saved configuration, knowledge, and complete credentials are provided to the Agent without provenance checks, automatic expiry, keyword retrieval, or additional redaction. Previously supplied keys need not be entered again. Values support up to 16,384 characters; credentials preserve spaces, newlines, and empty passwords using the existing encrypted storage. UI masking affects display only, with reveal, copy, edit, and delete controls.
+  - **Readable Work Logs & Simple Background Retries**: The LLM summarizes normal conversation into readable work history and reusable knowledge; related work can merge within 30 minutes. Conversation is persisted in SQLite and processed by UserDBDO Alarms, including after disconnection or instance restart. Failed extraction receives up to three additional retries, then the task is removed on success or exhaustion. No separate evidence package, execution ledger, dual queue, receipt framework, or notification polling. See [context and memory](docs/agent-context-memory.md).
+  - **Long-Task Context Summaries**: Older conversation is summarized through standard `/responses` calls while recent complete tool exchanges are retained. No `/responses/compact` dependency. Context/output budgets default to 64,000/8,192 tokens and are configurable; start a new Agent chat after changes.
+  - **Compatibility & Diagnostics**: Model capabilities vary; bounded compatibility changes apply only to explicitly unsupported optional parameters, and incomplete tool calls are not executed. Errors stay concise; detailed diagnostics appear in the web terminal only with `DEBUG_MODE=true`. Model configuration retains its custom dropdown, same-address discovery using saved credentials, and Base URL binding. Requests use `store:false`; verify the provider's actual retention policy.
 - **Quality Gates**: Before deploying either `test` or `main`, GitHub Actions performs frozen-lockfile installation, Worker/frontend type checking, unit and integration tests, reproducible frontend builds, Playwright browser E2E, and axe accessibility regression. Any failure blocks deployment.
 
 </details>
@@ -163,6 +168,7 @@ flowchart TB
     SSH_DO <-->|"Exec Channel"| AgentCore
     AgentCore <-->|"Work Logs & Knowledge"| User_DO
     AgentCore <-->|"LLM API"| External["External LLM Service"]
+    User_DO <-->|"Alarm Memory Distillation"| External
 ```
 
 <a id="quick-start"></a>
@@ -193,16 +199,25 @@ flowchart TB
 
 > **Note**: To deploy a test environment, repeat the above steps on the `test` branch to create a separate Worker (e.g., `cloudssh-test`). The Durable Objects data between both environments is completely isolated.
 
+> **Fork CI policy**: Deployment through the Cloudflare dashboard / Git integration does not require GitHub Actions or the Cloudflare Secrets used by this project's CI. Worker deployment, GitHub Pages publishing, and SSH interoperability jobs run only when the repository owner is `newbietan`. Other users' forks only need the optional upstream sync workflow. GitHub may show **Skipped** records for the restricted workflows, but no runners execute those jobs.
+
+##### Update Notices
+
+The app checks the official `main` branch for a newer stable version in the background. The connection page shows a compact version badge next to “Connection parameters”, with a dismissible hint when an update is available. User-space and desktop-terminal hints remain in the footer; mobile-terminal hints are inside “More actions”. Open the changelog and, if desired, sync your repository and redeploy. Nothing is automatically refreshed, upgraded, or disconnected. Dismissing a version does not hide later releases.
+
+The Worker reads public version metadata from a fixed official GitHub URL without forwarding user credentials or server information. Successful checks are cached for six hours; failures silently back off for 15 minutes and never affect normal use.
+
 ##### Optional: Automatically Sync Upstream Releases
 
-A fork can use the built-in `Sync upstream` GitHub Actions workflow to periodically synchronize the latest `main` branch from this project into its own `main` branch. This feature is **disabled by default**. Once enabled, it checks daily at 04:20 Asia/Shanghai; branch updates created by a successful sync are automatically built and deployed by Cloudflare Git integration, so no additional deployment toggle is required.
+A fork can optionally use the built-in `Sync upstream` GitHub Actions workflow to synchronize this project's latest `main` branch into its own `main` branch. **Manual sync requires no repository variable; scheduled sync is disabled by default.** Once explicitly enabled, scheduled sync checks daily at 04:20 Asia/Shanghai. Branch updates created by a successful sync are automatically built and deployed by Cloudflare Git integration, without additional CI deployment credentials.
 
 1. Make sure the Cloudflare Worker is connected to your fork, its Production branch is set to `main`, and automatic builds are enabled.
 2. Open the fork's **Actions** page and enable workflows. If an existing fork does not yet contain `Sync upstream`, first use GitHub's **Sync fork** feature once to obtain the workflow.
-3. Go to **Settings → Secrets and variables → Actions → Variables** and create a Repository variable:
+3. **On-demand sync**: Open **Actions → Sync upstream → Run workflow**, select `main`, and run it manually. No repository variable is required.
+4. **Optional scheduled sync**: Go to **Settings → Secrets and variables → Actions → Variables** and create a Repository variable:
    - Name: `AUTO_SYNC_UPSTREAM`
    - Value: `true`
-4. To sync immediately, open **Actions → Sync upstream → Run workflow**. Manual runs do not require the variable above.
+   - Delete the variable or set it to `false` to disable scheduled sync. Manual runs remain available.
 
 > **Sync behavior**: If upstream workflows change, automatic synchronization may fail. In that case, simply synchronize the repository manually once.
 
@@ -226,16 +241,15 @@ All feature flags and security controls are managed through Worker environment v
 | `DEBUG_MODE` | Optional | `false` | Detailed protocol debugging switch. When `true`, outputs detailed handshake and protocol logs in API responses and the frontend terminal. | Declared as `false` in `wrangler.toml`. Only enable temporarily when troubleshooting connection handshakes; keep `false` during regular production operation. |
 
 > **Configuration Recommendations & Notes**:
+>
 > 1. **Encrypted Secret Storage**: In the Cloudflare Dashboard under *Settings → Variables and Secrets*, it is strongly recommended to store all sensitive variables containing passwords, Secrets, or Keys as **Secret** type. Secrets are stored in Cloudflare's dedicated encrypted storage layer and will not be overwritten when rebuilding or redeploying code.
 > 2. **Reserved Variables**: `MAX_CONNECTIONS` is declared as an interface placeholder for future connection budgeting; it is currently unread by runtime code, so do not rely on it.
->
-> 3. **Wrangler deploy variable authority**: Instances deployed via Git integration / CLI (wrangler) treat `wrangler.toml` as the configuration source of truth — same-name plain-text variables in the Dashboard are overwritten on deploy, while **Secret-type values are unaffected**. `IDLE_TIMEOUT` / `REQUIRE_GITHUB_AUTH` / `ENABLE_SSH_SHARING` / `STRICT_HOST_KEY_VERIFY` ship via `[vars]` by default; customize them directly in `wrangler.toml`. Opt-in variables such as `TURNSTILE` and `ADMIN_PASSWORD_HASH` are best maintained as Dashboard Secrets.
 
 #### Optional: Enable Single-Admin Password Sign-In (Alternative to GitHub OAuth)
 
 Prefer signing in with your own custom password instead of GitHub OAuth? The instance then admits a single account — yours:
 
-1. **Generate the hash**: Enter your custom password (≥ 10 characters), confirm it, click "Generate hash", and copy the result. **The password never leaves your browser** — no local tooling required (with a Node environment you can also use `pnpm run hash-password`). Ways to open the generator:
+1. **Generate the hash**: Enter your custom password (≥ 10 characters), confirm it, click "Generate hash", and copy the result. **The password never leaves your browser** — no local tooling required. Ways to open the generator:
    - Fresh deployment (no sign-in configured): open your site and click "**Admin password sign-in setup**" at the bottom of the auth form;
    - Instances already using GitHub sign-in (including `REQUIRE_GITHUB_AUTH=true` forced login): open `https://your-domain/#password-setup` directly — no existing variables need touching;
    - Password rotation: open `#password-setup`, regenerate, and replace the Dashboard variable.
@@ -273,11 +287,11 @@ With GitHub OAuth enabled, users can log in with their GitHub account and save/m
    - `BASE_URL` = `https://your-domain.com` (your deployed domain)
    - `GITHUB_CLIENT_SECRET` = your Client Secret
 
-   The following two independent settings are optional:
+   The following three independent settings are optional:
 
    - `GITHUB_ALLOWED_USER_IDS`: Comma-separated GitHub **numeric user IDs** allowed to sign in, for example `83105156,6236783`. When omitted, every GitHub account may sign in. An empty or malformed configured value fails closed and denies every GitHub sign-in.
    - `REQUIRE_GITHUB_AUTH`: Set to `true` to disable anonymous SSH and require a valid GitHub session for every SSH WebSocket. When omitted or set to `false`, anonymous connections remain available.
-   - `ENABLE_SSH_SHARING`: Set to `true` to let signed-in users create one-time links for saved servers. It is disabled by default. Enabling it explicitly permits a bearer of the share capability to open an audited SSH session without signing in to GitHub.
+   - `ENABLE_SSH_SHARING`: Set to `true` to let signed-in users create one-time links for saved servers. Git-integrated / CLI deployments ship `true` via `wrangler.toml` for both production and test; set it to `false` to opt out. The runtime disables sharing when the variable is absent (e.g. manual Dashboard uploads without this variable). Enabling it permits a bearer of the share capability to open an audited SSH session without signing in.
 
    **Find a GitHub numeric user ID**:
 
@@ -299,7 +313,7 @@ With GitHub OAuth enabled, users can log in with their GitHub account and save/m
 
 1. **Redeploy**: Save the variables and redeploy the existing Worker. The Durable Object migration in the repository initializes the required classes and database; deleting the existing Worker is not required.
 
-> **Access Policy Note**: After `GITHUB_ALLOWED_USER_IDS` changes, existing sessions are checked again and become invalid on their next request; already established SSH WebSockets are not terminated. `REQUIRE_GITHUB_AUTH=true` depends on GitHub OAuth, so configure the Client ID, Client Secret, and `BASE_URL` together.
+> **Access Policy Note**: After `GITHUB_ALLOWED_USER_IDS` changes, existing sessions are checked again and become invalid on their next request; `REQUIRE_GITHUB_AUTH=true` depends on GitHub OAuth, so configure the Client ID, Client Secret, and `BASE_URL` together.
 
 ##### Using One-Time SSH Sharing
 
@@ -339,16 +353,10 @@ When adding or editing a server, choose the **"Cloudflare Tunnel"** transport mo
 ### AI Agent: Responses API Configuration and Sessions
 
 - **Protocol Specification & Provider Compatibility**:
-  - **Supported Providers**: Official OpenAI (`https://api.openai.com/v1`, models such as `gpt-4o`, `o1`, `o3-mini`, etc.), OpenRouter, and compatible platforms supporting the standard Responses API specification.
-  - **Currently Unsupported Providers**: Gateways providing only legacy Chat Completions (`/v1/chat/completions`) endpoints (such as direct DeepSeek API, Alibaba DashScope, Moonshot Kimi, etc.) will return HTTP 404/405 on `/responses`.
-  - **Recommendation**: If your current workflows rely heavily on models available exclusively through `/v1/chat/completions`, **it is recommended to temporarily stay on version v2.5.5** until upstream providers adopt the Responses specification.
-- **Configuration & Migration**: Configure an HTTPS API root (for example `https://api.openai.com/v1`) or a complete `/responses` address, model, and key. Legacy `/chat/completions` URLs are blocked and must be changed to the root URL. Changing the address strictly requires providing the API key (anti-credential-exfiltration defense preventing silent transmission of keys to new targets).
-- **Capability Requirements**: The provider and model must support the native Responses API: stateless execution (`store: false`), function tools, streaming Responses events, and JSON Schema output. Successful `/models` discovery does not prove these capabilities.
-- **Privacy & Data Retention**: All requests enforce `store: false` (stateless mode), preventing terminal output, command results, and credentials from being retained long-term on the model provider. History, checkpoints, and server memories remain controlled locally within CloudSSH.
-- **Context Budgets & Checkpoints**: The default context budget is 64,000 tokens and output budget 8,192 tokens (including reasoning). Usage is measured when available and conservatively estimated otherwise. Structured checkpoints start fresh continuation segments at the budget boundary without rewriting historical facts.
-- **Editing Branches & Verified Facts**: Edit checkpoints retain up to 64 recent user turns within a 512K-character total budget. Editing branches from before that turn and **does not undo remote operations**. Start a new chat if settings change or an edit checkpoint is unavailable; commands are never automatically replayed.
-- **Execution Safety Gates**: Incomplete arguments, stream failures, and failed model responses do not execute partial calls. Interrupted execution is explicitly recorded with verified status or "unknown" and requires inspection before retrying. Finishing streamed text does not finish the task.
-- **Auditing & Logging**: Worker logs contain only usage metadata: cumulative input/cached/output/reasoning tokens for main and checkpoint calls, and separate memory-call usage. They do not log request bodies or API keys.
+  - **Universal Compatibility**: Main tasks and context compaction require only support for the standard `/responses` endpoint and function tools, natively supporting official OpenAI (`gpt-4o`, `o1`, `o3-mini`, etc.), Azure OpenAI, OpenRouter, and standard Responses gateways.
+  - **Unsupported Interfaces**: Endpoints providing exclusively legacy Chat Completions (`/v1/chat/completions`) are not supported.
+  - **Implementation Details**: [Local context compaction and long-term memory](docs/agent-context-memory.md) (Chinese).
+- **Configuration & Migration**: Configure an HTTPS API root (for example `https://api.openai.com/v1`) or a complete `/responses` address, model, and key. Legacy `/chat/completions` URLs are blocked and must be changed to the root URL. Changing the address requires providing the API key again.
 
 <a id="development"></a>
 
@@ -378,16 +386,19 @@ CloudSSH/
 │       ├── sftp-editor-session.ts # SFTP online editing coordinator
 │       ├── sftp-helpers.ts        # SFTP breadcrumb parsing and multi-key sorting
 │       └── snippet-variables.ts   # Command snippet parameter placeholders parsing & replacement
-├── docs/                   # GitHub Pages static assets
+├── docs/                   # Technical documentation and GitHub Pages static assets
 │   └── theme-editor/       # Visual theme editor
 ├── scripts/                # Build scripts
-├── tests/                  # Vitest unit/integration + Playwright E2E and axe regression (build/ e2e/ ssh/ worker/)
-├── .github/workflows/      # CI/CD workflows (deploy / github-pages / sync-upstream)
+├── tests/                  # Vitest unit/integration + Playwright E2E and axe regression
+│   └── interop/            # Real SSH interoperability tests, including the Go workspace and gateway/ module
+├── .github/workflows/      # CI/CD (deploy / github-pages / ssh-interop / sync-upstream)
 ├── biome.json              # Code formatting and lint conventions
 ├── playwright.config.ts    # Browser E2E test configuration
 ├── pnpm-workspace.yaml     # pnpm workspace configuration
 └── wrangler.toml           # Cloudflare deployment configuration
 ```
+
+Project-wide configuration (`biome.json`, `tsconfig.json`, `vitest.config.ts`, `playwright.config.ts`, `wrangler.toml`, etc.) stays at the repository root for tool discovery. Go code is used only for [SSH interoperability tests](tests/interop/README.md); its workspace and dependency files all live under `tests/interop/` and are not part of production builds or deployments. Normal development and deployment do not require Go.
 
 ### Local Development
 
@@ -489,6 +500,18 @@ Thank you to the following contributors for improving CloudSSH's code, compatibi
 | [DAVID TB (@tbdavid2019)](https://github.com/tbdavid2019) | Contributed Traditional Chinese (zh-TW) interface and localized dictionary, expanding frontend language switching and theme editor support (#147) |
 
 The list and contribution summaries are based on Git history and accepted Pull Requests; one contributor may appear under multiple historical Git author names or email addresses. See [GitHub Contributors](https://github.com/newbietan/CloudSSH/graphs/contributors) for the complete record. Issues and Pull Requests are welcome.
+
+<a id="sponsor"></a>
+
+## Sponsor
+
+If CloudSSH has been helpful to your workflow or projects, consider sponsoring the project on Afdian. Your support helps sustain ongoing maintenance, optimization, and feature development!
+
+- **Afdian**: [https://afdian.com/a/newbietan](https://afdian.com/a/newbietan)
+
+<a href="https://afdian.com/a/newbietan" target="_blank">
+  <img src="https://pic1.afdiancdn.com/static/img/welcome/button-sponsorme.png" alt="Sponsor on Afdian" width="200">
+</a>
 
 <a id="license"></a>
 

@@ -3,21 +3,7 @@
 import { isBlockedCommand, needsConfirmation } from './safety';
 import { validateBaseUrlWithDNS } from './ssrf';
 import type { TerminalContext } from './terminal-context';
-import type { ExecutionStatus, ExecResult } from './types';
-
-const STATUSES: ExecutionStatus[] = ['succeeded', 'failed', 'blocked', 'rejected', 'cancelled', 'invalid_arguments', 'unknown'];
-
-export function executionOutcome(tool: string, output: string): { status: ExecutionStatus; executed: boolean } {
-  let value: Record<string, unknown> = {};
-  try { value = JSON.parse(output); } catch { /* Text-only observations/confirmation. */ }
-  const status: ExecutionStatus = STATUSES.includes(value?.status as ExecutionStatus) ? value.status as ExecutionStatus
-    : value?.blocked ? 'blocked' : value?.user_rejected || output.startsWith('User rejected') ? 'rejected'
-      : typeof value?.exit_code === 'number' && value.exit_code !== 0 ? 'failed' : 'succeeded';
-  const executed = typeof value?.executed === 'boolean' ? value.executed
-    : !['blocked', 'rejected', 'cancelled', 'invalid_arguments'].includes(status) &&
-      !['read_terminal_context', 'ask_user_confirmation', 'fetch_web_content'].includes(tool);
-  return { status, executed };
-}
+import type { ExecResult } from './types';
 
 // 工具结果进入 LLM 上下文的硬边界：head/tail 式截断（保留头尾、省略中间），
 // 防止 docker logs 等大输出把后续每轮 LLM 请求体撑到数 MB（弱网下直接拖垮 Agent）。
@@ -43,21 +29,11 @@ export class ToolExecutor {
   constructor(
     private terminalContext: TerminalContext,
     private execCommand: ExecCommandFn,
-    private askConfirmation: (command: string, reason: string) => Promise<boolean>,
+    private askConfirmation: (command: string, reason: string, signal?: AbortSignal) => Promise<boolean>,
     private resetTimeout?: () => void
   ) {}
 
   async execute(toolName: string, args: any, signal?: AbortSignal): Promise<string> {
-    const output = await this.executeRaw(toolName, args, signal);
-    const outcome = executionOutcome(toolName, output);
-    try {
-      const value = JSON.parse(output);
-      if (value && typeof value === 'object' && !Array.isArray(value)) return JSON.stringify({ ...value, ...outcome });
-    } catch { /* Text-only tools still receive explicit, non-authorizing outcomes. */ }
-    return JSON.stringify({ ...outcome, result: output });
-  }
-
-  private async executeRaw(toolName: string, args: any, signal?: AbortSignal): Promise<string> {
     switch (toolName) {
       case 'execute_command':
         return this.handleExec(args.command, args.timeout_ms ?? 10000, signal);
@@ -101,6 +77,7 @@ export class ToolExecutor {
     if (confirm.required) {
       const approved = await this.askConfirmationWithAbort(command, confirm.reason!, signal);
       if (!approved) {
+        if (signal?.aborted) return JSON.stringify({ status: 'cancelled', executed: false });
         return JSON.stringify({
           stdout: '',
           stderr: '用户拒绝执行此命令',
@@ -110,6 +87,7 @@ export class ToolExecutor {
       }
     }
 
+    if (signal?.aborted) return JSON.stringify({ status: 'cancelled', executed: false });
     const clampedTimeout = Math.min(Math.max(timeout, 1000), 180000);
 
     // 对于长时间命令（>60秒），定期重置看门狗计时器
@@ -319,6 +297,7 @@ export class ToolExecutor {
     signal?: AbortSignal
   ): Promise<string> {
     const approved = await this.askConfirmationWithAbort(command, reason, signal);
+    if (signal?.aborted) return JSON.stringify({ status: 'cancelled', executed: false });
     return approved
       ? 'User approved'
       : 'User rejected the command. Do not retry without user approval.';
@@ -334,12 +313,23 @@ export class ToolExecutor {
     signal?: AbortSignal
   ): Promise<boolean> {
     if (signal?.aborted) return Promise.resolve(false);
-    return Promise.race([
-      this.askConfirmation(command, reason),
-      new Promise<boolean>((resolve) => {
-        signal?.addEventListener('abort', () => resolve(false), { once: true });
-      }),
-    ]);
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const settle = (approved: boolean) => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener('abort', abort);
+        resolve(approved);
+      };
+      const abort = () => settle(false);
+      signal?.addEventListener('abort', abort, { once: true });
+      // Pass cancellation through to the owner of the pending confirmation slot.
+      // Remove our listener on BOTH approval and cancellation, not just abort.
+      Promise.resolve().then(() => {
+        if (signal?.aborted) return false;
+        return this.askConfirmation(command, reason, signal);
+      }).then(settle, () => settle(false));
+    });
   }
 
   private async handleDetectEnvironment(signal?: AbortSignal): Promise<string> {
